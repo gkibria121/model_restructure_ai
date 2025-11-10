@@ -48,41 +48,42 @@ os.environ['TORCHAUDIO_USE_BACKEND_DISPATCHER'] = '0'
 # ============================================================================
 # LOGGING SETUP
 # ============================================================================
-
 class LoggerSetup:
     """Configure logging for the entire application"""
     
     @staticmethod
-    def setup_logger(log_file: str = "log.txt", level=logging.INFO):
-        """Setup logger with file and console handlers"""
-        # Create logger
+    def setup_logger(
+        log_file: str = "log.txt", 
+        level=logging.INFO, 
+        console: bool = True
+    ):
+        """Setup logger with file handler, optionally console output"""
         logger = logging.getLogger('AIVoiceDetection')
         logger.setLevel(level)
-        
-        # Remove existing handlers
         logger.handlers.clear()
         
-        # Create formatters
+        # Formatter for file
         detailed_formatter = logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
-        simple_formatter = logging.Formatter(
-            '%(asctime)s - %(levelname)s - %(message)s',
-            datefmt='%H:%M:%S'
-        )
         
-        # File handler (detailed)
+        # File handler
         file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(detailed_formatter)
         logger.addHandler(file_handler)
         
-        # Console handler (simple)
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(logging.INFO)
-        console_handler.setFormatter(simple_formatter)
-        logger.addHandler(console_handler)
+        # Optional console handler
+        if console:
+            simple_formatter = logging.Formatter(
+                '%(asctime)s - %(levelname)s - %(message)s',
+                datefmt='%H:%M:%S'
+            )
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setLevel(logging.INFO)
+            console_handler.setFormatter(simple_formatter)
+            logger.addHandler(console_handler)
         
         # Log initial setup
         logger.info("="*80)
@@ -91,8 +92,8 @@ class LoggerSetup:
         
         return logger
 
-# Initialize global logger
-logger = LoggerSetup.setup_logger()
+# Example usage
+logger = LoggerSetup.setup_logger(console=False)  # Console logging OFF
 
 # ============================================================================
 # CONFIGURATION
@@ -105,9 +106,9 @@ class Config:
     COMBINED_DIR = r"./dataset"
     AI_DIR = os.path.join(COMBINED_DIR, "ai")
     REAL_DIR = os.path.join(COMBINED_DIR, "real")
-    CLEAN_DIR = os.path.join(COMBINED_DIR, "clean_audio_unique")
-    IMG_DIR = os.path.join(COMBINED_DIR, "spectrogram_images_clean_unique")
-    SPLIT_DIR = os.path.join(IMG_DIR, "_splits")
+    CLEAN_DIR = os.path.join("./output", "clean_audio_unique")
+    IMG_DIR = os.path.join("./output", "spectrogram_images_clean_unique")
+    SPLIT_DIR = os.path.join("./output", "_splits")
     
     # Audio settings
     SR = 16000
@@ -406,10 +407,11 @@ class AudioDenoiser:
             original_shape = wav.shape
             
             # Convert mono to stereo for Demucs (which expects 2 channels)
-            if wav.dim() == 1:
+            # FIX: Use len(original_shape) instead of original_shape.dim()
+            if len(original_shape) == 1:
                 # Mono: (T,) -> (2, T) by duplicating
                 wav_stereo = wav.unsqueeze(0).repeat(2, 1)
-            elif wav.dim() == 2 and wav.shape[0] == 1:
+            elif len(original_shape) == 2 and original_shape[0] == 1:
                 # Mono: (1, T) -> (2, T) by duplicating
                 wav_stereo = wav.repeat(2, 1)
             else:
@@ -439,7 +441,8 @@ class AudioDenoiser:
                 vocals = out[:, vocals_idx, :, :]  # Get vocals source (1, channels, T)
                 
                 # Convert back to original channel format
-                if original_shape.dim() == 1 or (original_shape.dim() == 2 and original_shape[0] == 1):
+                # FIX: Use len(original_shape) instead of original_shape.dim()
+                if len(original_shape) == 1 or (len(original_shape) == 2 and original_shape[0] == 1):
                     # Original was mono - average stereo channels
                     vocals = vocals.mean(dim=1, keepdim=True)  # (1, 1, T)
                 else:
@@ -452,7 +455,8 @@ class AudioDenoiser:
             elif out.dim() == 3:
                 # Alternative output format
                 vocals = out[-1, :, :]  # Take last source as vocals
-                if original_shape.dim() == 1 or (original_shape.dim() == 2 and original_shape[0] == 1):
+                # FIX: Use len(original_shape) instead of original_shape.dim()
+                if len(original_shape) == 1 or (len(original_shape) == 2 and original_shape[0] == 1):
                     vocals = vocals.mean(dim=0, keepdim=True)  # Convert to mono if original was mono
             else:
                 logger.warning(f"Unexpected Demucs output shape: {out.shape}")
@@ -474,8 +478,7 @@ class AudioDenoiser:
             
         except Exception as e:
             logger.warning(f"Demucs processing failed: {e}")
-            return None 
- 
+            return None
 
 class AudioPreprocessor:
     """Audio preprocessing: VAD, HPF, pre-emphasis"""
@@ -1204,7 +1207,7 @@ class AudioProcessingPipeline:
         logger.info("AudioProcessingPipeline initialized")
     
     def process_folder(self, src_dir: str, dst_dir: str, 
-                      denoise: bool = False, method: str = "auto"):
+                      denoise: bool = True, method: str = "auto"):
         """Process all audio files in a folder"""
         logger.info(f"Processing folder: {src_dir} -> {dst_dir}")
         logger.info(f"Denoise: {denoise}, Method: {method}")
@@ -1445,14 +1448,14 @@ class WorkflowManager:
         self.pipeline.process_folder(
             Config.AI_DIR,
             os.path.join(Config.CLEAN_DIR, "ai"),
-            denoise=False, method="auto"
+            denoise=True, method="auto"
         )
         
         # Process Real audio
         self.pipeline.process_folder(
             Config.REAL_DIR,
             os.path.join(Config.CLEAN_DIR, "real"),
-            denoise=False, method="auto"
+            denoise=True, method="auto"
         )
         
         logger.info("="*60)
