@@ -13,8 +13,7 @@ import sys
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional 
  
-import time 
-
+import time  
 import numpy as np
 import pandas as pd
 import librosa 
@@ -293,25 +292,39 @@ class AudioDenoiser:
     def __init__(self, device: str = Config.DEVICE):
         self.device = device
         self.window = torch.hann_window(Config.DENOISE_WIN, device=device)
-        self.demucs_model = self._init_demucs()
-        logger.debug(f"AudioDenoiser initialized - Demucs available: {self.demucs_model is not None}")
+        self.demucs_model = None
+        self.demucs_apply_model = None
+        self.demucs_ok = False
+        self._init_demucs()
+        logger.debug(f"AudioDenoiser initialized - Demucs available: {self.demucs_ok}")
     
     def _init_demucs(self):
         """Initialize Demucs model if available"""
+        # First try to import apply_model
+        try:
+            from demucs.apply import apply_model
+            self.demucs_apply_model = apply_model
+        except ImportError:
+            self.demucs_apply_model = None
+            logger.debug("apply_model not available")
+        
+        # Then try to load the model
         try:
             from demucs.pretrained import get_model as demucs_get_model
-            model = demucs_get_model("htdemucs")
+            self.demucs_model = demucs_get_model("htdemucs")
+            self.demucs_model.to(self.device).eval()
+            self.demucs_ok = True
             logger.info("Demucs model loaded successfully (from pretrained)")
-            return model.to(self.device).eval()
         except Exception as e:
             logger.debug(f"Demucs pretrained loading failed: {e}")
             try:
-                model = torch.hub.load("facebookresearch/demucs:main", "htdemucs")
+                self.demucs_model = torch.hub.load("facebookresearch/demucs:main", "htdemucs")
+                self.demucs_model.to(self.device).eval()
+                self.demucs_ok = True
                 logger.info("Demucs model loaded successfully (from torch.hub)")
-                return model.to(self.device).eval()
             except Exception as e2:
                 logger.warning(f"Demucs not available: {e2}")
-                return None
+                self.demucs_ok = False
     
     @torch.no_grad()
     def denoise(self, wav: torch.Tensor, method: str = "auto") -> torch.Tensor:
@@ -369,37 +382,100 @@ class AudioDenoiser:
         
         logger.debug("Spectral gating complete")
         return AudioLoader._normalize(wav_out)
-    
     @torch.no_grad()
     def _demucs_denoise(self, wav: torch.Tensor) -> Optional[torch.Tensor]:
-        """Demucs vocal separation"""
-        if self.demucs_model is None:
+        """
+        Use Demucs to separate 'vocals' from 'other' and keep vocals as denoised speech.
+        If Demucs fails, returns None.
+        """
+        if not self.demucs_ok or self.demucs_model is None:
             return None
         
-        try:
-            logger.debug("Running Demucs vocal separation")
-            x = wav.unsqueeze(0)  # (1, 1, T)
-            out = self.demucs_model(x)
+        # Ensure input is on correct device and is a tensor
+        if not isinstance(wav, torch.Tensor):
+            logger.error(f"Expected torch.Tensor, got {type(wav)}")
+            return None
             
+        if wav.device != self.device:
+            wav = wav.to(self.device)
+            
+        try:
+            logger.debug(f"Running Demucs vocal separation on tensor shape: {wav.shape}")
+            
+            # Store original shape for restoration
+            original_shape = wav.shape
+            
+            # Convert mono to stereo for Demucs (which expects 2 channels)
+            if wav.dim() == 1:
+                # Mono: (T,) -> (2, T) by duplicating
+                wav_stereo = wav.unsqueeze(0).repeat(2, 1)
+            elif wav.dim() == 2 and wav.shape[0] == 1:
+                # Mono: (1, T) -> (2, T) by duplicating
+                wav_stereo = wav.repeat(2, 1)
+            else:
+                # Already stereo or multi-channel, use as is
+                wav_stereo = wav
+            
+            # Prepare input: (batch, channels, samples)
+            x = wav_stereo.unsqueeze(0)  # (1, channels, T)
+            
+            # Use apply_model if available, otherwise use direct model call
+            if self.demucs_apply_model is not None:
+                logger.debug("Using apply_model for Demucs")
+                out = self.demucs_apply_model(self.demucs_model, x, device=self.device)
+            else:
+                logger.debug("Using direct model call for Demucs")
+                out = self.demucs_model(x)
+            
+            # Handle output - extract vocals
             if isinstance(out, (list, tuple)):
                 out = out[0]
             
             if out.dim() == 4:
-                sources = getattr(self.demucs_model, "sources", ['drums','bass','other','vocals'])
-                vocals_idx = sources.index('vocals') if 'vocals' in sources else -1
-                vocals = out[:, vocals_idx, 0, :]
+                # Standard case: (batch, sources, channels, samples)
+                # Get vocals index - typically 3 for htdemucs
+                vocals_idx = getattr(self.demucs_model, "sources", ['drums','bass','other','vocals']).index('vocals') \
+                            if hasattr(self.demucs_model, "sources") and 'vocals' in self.demucs_model.sources else 3
+                vocals = out[:, vocals_idx, :, :]  # Get vocals source (1, channels, T)
+                
+                # Convert back to original channel format
+                if original_shape.dim() == 1 or (original_shape.dim() == 2 and original_shape[0] == 1):
+                    # Original was mono - average stereo channels
+                    vocals = vocals.mean(dim=1, keepdim=True)  # (1, 1, T)
+                else:
+                    # Keep stereo
+                    vocals = vocals  # (1, channels, T)
+                    
+                # Remove batch dimension
+                vocals = vocals.squeeze(0)  # (channels, T)
+                
             elif out.dim() == 3:
-                vocals = out[-1, 0, :].unsqueeze(0)
+                # Alternative output format
+                vocals = out[-1, :, :]  # Take last source as vocals
+                if original_shape.dim() == 1 or (original_shape.dim() == 2 and original_shape[0] == 1):
+                    vocals = vocals.mean(dim=0, keepdim=True)  # Convert to mono if original was mono
             else:
-                logger.warning("Unexpected Demucs output shape")
+                logger.warning(f"Unexpected Demucs output shape: {out.shape}")
                 return None
             
-            logger.debug("Demucs separation successful")
-            return AudioLoader._normalize(vocals)
+            # Ensure we have a valid tensor
+            if not isinstance(vocals, torch.Tensor):
+                logger.error(f"Demucs returned non-tensor: {type(vocals)}")
+                return None
+                
+            # Normalize
+            wav_clean = vocals
+            mx = torch.amax(torch.abs(wav_clean))
+            if mx > 0:
+                wav_clean = wav_clean / mx
+            
+            logger.debug(f"Demucs separation successful, output shape: {wav_clean.shape}")
+            return wav_clean
+            
         except Exception as e:
             logger.warning(f"Demucs processing failed: {e}")
-            return None
-
+            return None 
+ 
 
 class AudioPreprocessor:
     """Audio preprocessing: VAD, HPF, pre-emphasis"""
@@ -1128,7 +1204,7 @@ class AudioProcessingPipeline:
         logger.info("AudioProcessingPipeline initialized")
     
     def process_folder(self, src_dir: str, dst_dir: str, 
-                      denoise: bool = True, method: str = "auto"):
+                      denoise: bool = False, method: str = "auto"):
         """Process all audio files in a folder"""
         logger.info(f"Processing folder: {src_dir} -> {dst_dir}")
         logger.info(f"Denoise: {denoise}, Method: {method}")
