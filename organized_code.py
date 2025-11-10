@@ -1133,8 +1133,8 @@ class Evaluator:
         axes[1].set_title(f"Confusion Matrix — {title}")
         
         plt.tight_layout()
-        plt.savefig(f"{title.replace(' ', '_')}_results.png")
-        logger.info(f"Results plot saved: {title.replace(' ', '_')}_results.png")
+        plt.savefig(f"output/{title.replace(' ', '_')}_results.png")
+        logger.info(f"Results plot saved: output/{title.replace(' ', '_')}_results.png")
         plt.show()
     
     @staticmethod
