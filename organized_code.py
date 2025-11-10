@@ -953,7 +953,7 @@ class AudioProcessingPipeline:
         self.spec_gen = SpectrogramGenerator()
     
     def process_folder(self, src_dir: str, dst_dir: str, 
-                      denoise: bool = False, method: str = "auto"):
+                      denoise: bool = True, method: str = "auto"):
         """Process all audio files in a folder"""
         os.makedirs(dst_dir, exist_ok=True)
         files = FileUtils.list_audio_files(src_dir)
@@ -981,7 +981,7 @@ class AudioProcessingPipeline:
                 # Save
                 self._save_wav(wav, out_path)
             except Exception as e:
-                print(e)
+           
                 skipped += 1
         
         print(f"{src_dir} -> {dst_dir} | total={len(files)} | skipped={skipped}")
@@ -1167,14 +1167,14 @@ class WorkflowManager:
         self.pipeline.process_folder(
             Config.AI_DIR,
             os.path.join(Config.CLEAN_DIR, "ai"),
-            denoise=False, method="auto"
+            denoise=True, method="auto"
         )
         
         # Process Real audio
         self.pipeline.process_folder(
             Config.REAL_DIR,
             os.path.join(Config.CLEAN_DIR, "real"),
-            denoise=False, method="auto"
+            denoise=True, method="auto"
         )
         
         print("\n" + "="*60)
@@ -1273,7 +1273,7 @@ def main_training_workflow():
     
     # Step 3: Tune threshold and evaluate
     results, threshold = workflow.tune_and_evaluate(model_path, "efficientnet_b0")
-    print(model_path)  
+ 
     # Step 4: Export for inference
     detector = VoiceDetector(model_path, threshold=threshold)
     export_path = os.path.join(Config.IMG_DIR, "efficientnet_b0_ai_vs_real.torchscript.pt")
