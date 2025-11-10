@@ -3,22 +3,16 @@ AI vs Real Voice Detection System
 Organized with proper OOP structure
 """
 
-import os
-import sys
-import random
-import math
-import json
-import time
+import os 
+import random 
 import glob
 import hashlib
 import warnings
-from typing import List, Dict, Tuple, Optional, Union
-from pathlib import Path
-
+from typing import List, Dict, Tuple, Optional 
+  
 import numpy as np
 import pandas as pd
-import librosa
-import librosa.display
+import librosa 
 import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
@@ -129,9 +123,17 @@ class FileUtils:
     def list_audio_files(folder: str, exts: tuple = Config.AUDIO_EXTS) -> List[str]:
         """Recursively list all audio files in folder"""
         files = []
+        
         for ext in exts:
             files.extend(glob.glob(os.path.join(folder, f"**/*{ext}"), recursive=True))
 
+        return files
+    @staticmethod
+    def list_image_files(folder: str, exts: tuple = (".png", ".jpg", ".jpeg")) -> List[str]:
+        """Recursively list all image files in a folder"""
+        files = []
+        for ext in exts:
+            files.extend(glob.glob(os.path.join(folder, f"**/*{ext}"), recursive=True))
         return files
     
     @staticmethod
@@ -145,75 +147,56 @@ class FileUtils:
 # ============================================================================
 # AUDIO PROCESSING
 # ============================================================================
+import torch
+import librosa
+import soundfile as sf
+import numpy as np 
+from typing import Optional
+import warnings 
 
 class AudioLoader:
-    """Robust audio loading with multiple fallbacks"""
-    
-    def __init__(self, target_sr: int = Config.SR, device: str = Config.DEVICE):
+    """Load any audio file robustly using multiple fallback methods"""
+
+    def __init__(self, target_sr: int = 16000, device: str = "cpu"):
         self.target_sr = target_sr
         self.device = device
-    
+ 
     @torch.no_grad()
-    def load(self, path: str) -> Optional[torch.Tensor]:
-        """Load audio with fallback methods, returns (1, T) tensor on device"""
-        # Try torchaudio
-       
-        wav = self._try_torchaudio(path)
-      
-        if wav is not None:
-            return wav
-        
-        # Try soundfile
-        wav = self._try_soundfile(path)
-        if wav is not None:
-            return wav
-        
-        # Try librosa
-        wav = self._try_librosa(path)
-        return wav
-    
-    def _try_torchaudio(self, path: str) -> Optional[torch.Tensor]:
-        try:  
-            
+    def load(self, path: str) -> torch.Tensor:
+        try:
             wav, sr = torchaudio.load(path)
-            return self._process_wav(wav, sr)
-        except Exception as e: 
-            return None
-    
-    def _try_soundfile(self, path: str) -> Optional[torch.Tensor]:
+            if wav.shape[0] > 1: wav = wav.mean(dim=0, keepdim=True)
+            if sr != self.target_sr:  wav = torchaudio.functional.resample(wav, sr,   self.target_sr)
+            mx = torch.amax(torch.abs(wav)); 
+            if mx > 0: wav = wav / mx
+            return wav.to(self.device)
+        except Exception  :
+         
+            pass
+        # 2) soundfile
         try:
             y, sr = sf.read(path, dtype="float32", always_2d=False)
-            if y.ndim == 2:
-                y = y.mean(axis=1)
+            if y.ndim == 2: y = y.mean(axis=1)
             wav = torch.from_numpy(y).unsqueeze(0)
-            return self._process_wav(wav, sr)
+            if sr !=  self.target_sr: wav = torchaudio.functional.resample(wav, sr,  self.target_sr)
+            mx = torch.amax(torch.abs(wav)); 
+            if mx > 0: wav = wav / mx
+            return wav.to(self.device)
         except Exception:
-            return None
-    
-    def _try_librosa(self, path: str) -> Optional[torch.Tensor]:
+            pass
+        # 3) librosa
         try:
-            y, sr = librosa.load(path, sr=self.target_sr, mono=True)
-            wav = torch.from_numpy(y.astype(np.float32)).unsqueeze(0)
-            return self._normalize(wav).to(self.device)
+            y, sr = librosa.load(path, sr= self.target_sr, mono=True)
+            wav = torch.from_numpy(y.astype(np.float32)).unsqueeze(0).to(self.device)
+            mx = torch.amax(torch.abs(wav)); 
+            if mx > 0: wav = wav / mx
+            return wav
         except Exception:
             return None
-    
-    def _process_wav(self, wav: torch.Tensor, sr: int) -> torch.Tensor:
-        """Process loaded waveform"""
-        if wav.shape[0] > 1:
-            wav = wav.mean(dim=0, keepdim=True)
-        if sr != self.target_sr:
-            wav = torchaudio.functional.resample(wav, sr, self.target_sr)
-        return self._normalize(wav).to(self.device)
-    
     @staticmethod
-    def _normalize(wav: torch.Tensor) -> torch.Tensor:
-        """Normalize waveform"""
+    def _normalize( wav):
         mx = torch.amax(torch.abs(wav))
-        if mx > 0:
-            wav = wav / mx
-        return wav
-
+        return wav / (mx + 1e-8)
 
 class AudioDenoiser:
     """Audio denoising with spectral gating and optional Demucs"""
@@ -313,7 +296,7 @@ class AudioDenoiser:
             else:
                 return None
             
-            return AudioLoader._normalize(vocals)
+            return   AudioLoader._normalize(vocals)
         except Exception:
             return None
 
@@ -476,16 +459,14 @@ class DatasetBuilder:
     
     def create_splits(self, test_size: float = 0.2, val_size: float = 0.5):
         """Create train/val/test splits"""
-        ai_files = FileUtils.list_audio_files(os.path.join(self.base_dir, "ai"))
-        real_files = FileUtils.list_audio_files(os.path.join(self.base_dir, "real"))
+        ai_files = FileUtils.list_image_files(os.path.join(self.base_dir, "ai") )
+        real_files = FileUtils.list_image_files(os.path.join(self.base_dir, "real"))
         
-        # Filter only PNG files
-        ai_files = [f for f in ai_files if f.endswith('.png')]
-        real_files = [f for f in real_files if f.endswith('.png')]
+ 
         
         paths = ai_files + real_files
         labels = [1] * len(ai_files) + [0] * len(real_files)
-      
+    
         # Stratified split
         train_paths, temp_paths, train_labels, temp_labels = train_test_split(
             paths, labels, test_size=test_size, random_state=Config.SEED,
@@ -972,23 +953,23 @@ class AudioProcessingPipeline:
         self.spec_gen = SpectrogramGenerator()
     
     def process_folder(self, src_dir: str, dst_dir: str, 
-                      denoise: bool = True, method: str = "auto"):
+                      denoise: bool = False, method: str = "auto"):
         """Process all audio files in a folder"""
         os.makedirs(dst_dir, exist_ok=True)
         files = FileUtils.list_audio_files(src_dir)
         skipped = 0
-        
+       
         for fp in tqdm(files, desc=f"Processing {os.path.basename(src_dir)}"):
             out_name = FileUtils.unique_output_name(fp)
             out_path = os.path.join(dst_dir, out_name)
-         
+           
             if os.path.exists(out_path):
                 continue
       
             try:
                 # Load
                 wav = self.loader.load(fp)
-               
+             
                 if wav is None:
                     skipped += 1
                     continue
@@ -1000,6 +981,7 @@ class AudioProcessingPipeline:
                 # Save
                 self._save_wav(wav, out_path)
             except Exception as e:
+                print(e)
                 skipped += 1
         
         print(f"{src_dir} -> {dst_dir} | total={len(files)} | skipped={skipped}")
@@ -1041,8 +1023,7 @@ class AudioProcessingPipeline:
      
        
         print(f"{audio_dir} -> {output_dir} | total={len(files)} | skipped={skipped}")
-        exit()
-    
+ 
     @staticmethod
     def _save_wav(tensor_gpu: torch.Tensor, path: str, sr: int = Config.SR):
         """Save tensor as WAV file"""
@@ -1054,27 +1035,56 @@ class AudioProcessingPipeline:
 # INFERENCE
 # ============================================================================
 
+import os
+import torch
+from torch import nn
+
 class VoiceDetector:
     """High-level interface for AI voice detection"""
     
-    def __init__(self, model_path: str, threshold: float = 0.5,
-                 device: str = Config.DEVICE):
+    def __init__(self, model_path: str, model_name: str = None, threshold: float = 0.5,
+                 device: str = "cpu"):
         self.device = device
         self.threshold = threshold
-        
-        # Load model
-        if model_path.endswith('.torchscript.pt'):
-            self.model = torch.jit.load(model_path, map_location=device)
-        else:
-            # Load regular PyTorch model (requires model architecture)
-            self.model = torch.load(model_path, map_location=device)
-        
+        self.model_path = model_path
+
+        # --- Auto-detect model name if not provided ---
+        if model_name is None:
+            model_name = self._infer_model_name(model_path)
+        print(f"🧠 Detected model architecture: {model_name}")
+
+        # --- Build model using factory ---
+        self.model = ModelFactory.create_model(model_name)
+
+        # --- Load state dict safely ---
+        state_dict = torch.load(model_path, map_location=device)
+        self.model.load_state_dict(state_dict, strict=False)
+
+        # --- Prepare model for inference ---
+        self.model.to(device)
         self.model.eval()
-        
-        # Initialize components
+
+        # --- Initialize helper components ---
         self.loader = AudioLoader(device=device)
         self.preprocessor = AudioPreprocessor(device=device)
         self.spec_gen = SpectrogramGenerator(device=device)
+
+        print(f"✅ VoiceDetector ready with {model_name}")
+
+    # --------------------------------------------------------------------------
+    def _infer_model_name(self, path: str) -> str:
+        """Infer model name from filename (e.g. best_efficientnet_b0.pt → efficientnet_b0)"""
+        name = os.path.basename(path).lower()
+        candidates = [
+            "resnet18", "efficientnet_b0", "efficientnet_b1",
+            "densenet121", "densenet169", "mobilenet_v3_small",
+            "convnext_tiny", "vit_b16", "swin_tiny"
+        ]
+        for candidate in candidates:
+            if candidate in name:
+                return candidate
+        raise ValueError(f"❌ Could not infer model name from: {name}")
+
     
     @torch.no_grad()
     def predict(self, audio_path: str) -> Dict:
@@ -1157,14 +1167,14 @@ class WorkflowManager:
         self.pipeline.process_folder(
             Config.AI_DIR,
             os.path.join(Config.CLEAN_DIR, "ai"),
-            denoise=True, method="auto"
+            denoise=False, method="auto"
         )
         
         # Process Real audio
         self.pipeline.process_folder(
             Config.REAL_DIR,
             os.path.join(Config.CLEAN_DIR, "real"),
-            denoise=True, method="auto"
+            denoise=False, method="auto"
         )
         
         print("\n" + "="*60)
@@ -1263,7 +1273,7 @@ def main_training_workflow():
     
     # Step 3: Tune threshold and evaluate
     results, threshold = workflow.tune_and_evaluate(model_path, "efficientnet_b0")
-    
+    print(model_path)  
     # Step 4: Export for inference
     detector = VoiceDetector(model_path, threshold=threshold)
     export_path = os.path.join(Config.IMG_DIR, "efficientnet_b0_ai_vs_real.torchscript.pt")
