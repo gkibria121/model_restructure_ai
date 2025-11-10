@@ -12,7 +12,9 @@ import logging
 import sys
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional 
-  
+ 
+import time 
+
 import numpy as np
 import pandas as pd
 import librosa 
@@ -214,11 +216,12 @@ class FileUtils:
     def unique_output_name(src_path: str) -> str:
         """Generate unique output name: <basename>__<ext>__<hash>.wav"""
         base, ext = os.path.splitext(os.path.basename(src_path))
-        h = hashlib.sha1(os.path.abspath(src_path).encode("utf-8")).hexdigest()[:10]
+        # Include timestamp (milliseconds)
+        unique_str = f"{os.path.abspath(src_path)}_{time.time_ns()}"
+        h = hashlib.sha1(unique_str.encode("utf-8")).hexdigest()[:10]
         name = f"{base}__{ext.lstrip('.').lower()}__{h}.wav"
         logger.debug(f"Generated unique name: {name}")
         return name
-
 
 # ============================================================================
 # AUDIO PROCESSING
@@ -1366,14 +1369,14 @@ class WorkflowManager:
         self.pipeline.process_folder(
             Config.AI_DIR,
             os.path.join(Config.CLEAN_DIR, "ai"),
-            denoise=True, method="auto"
+            denoise=False, method="auto"
         )
         
         # Process Real audio
         self.pipeline.process_folder(
             Config.REAL_DIR,
             os.path.join(Config.CLEAN_DIR, "real"),
-            denoise=True, method="auto"
+            denoise=False, method="auto"
         )
         
         logger.info("="*60)
