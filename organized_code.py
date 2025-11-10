@@ -1,470 +1,446 @@
 """
 AI vs Real Voice Detection System
-===================================
-A production-ready pipeline for detecting AI-generated voices using deep learning.
-
-Usage:
-    # Training
-    detector = VoiceDetector(model_name='efficientnet_b0')
-    detector.prepare_dataset('path/to/ai_folder', 'path/to/real_folder')
-    detector.train(epochs=12)
-    
-    # Inference
-    result = detector.predict('path/to/audio.wav')
-    print(f"Prediction: {result['label']} (confidence: {result['confidence']:.2%})")
+Organized with proper OOP structure
 """
-import soundfile as sf
-from pathlib import Path
-from typing import Union
-from tqdm import tqdm
-import traceback
+
 import os
 import sys
+import random
+import math
 import json
+import time
 import glob
+import hashlib
 import warnings
+from typing import List, Dict, Tuple, Optional, Union
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Union
-from dataclasses import dataclass, asdict
-from abc import ABC, abstractmethod
 
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-import torchaudio
 import librosa
-import soundfile as sf
-from PIL import Image
+import librosa.display
+import matplotlib.pyplot as plt
+import seaborn as sns
 from tqdm import tqdm
+from PIL import Image, ImageFile
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     classification_report, confusion_matrix, 
     roc_auc_score, roc_curve, auc
 )
-import matplotlib.pyplot as plt
-import seaborn as sns
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torchaudio
+import soundfile as sf
+import torchvision.transforms as T
+from torchvision.models import (
+    resnet18, efficientnet_b0, efficientnet_b1,
+    densenet121, densenet169, mobilenet_v3_small,
+    convnext_tiny, vit_b_16, swin_t
+)
+
+# Critical stability settings
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 warnings.filterwarnings('ignore')
-
-
+os.environ['TORCHAUDIO_USE_BACKEND_DISPATCHER'] = '0'
 # ============================================================================
-# Configuration Classes
+# CONFIGURATION
 # ============================================================================
 
-@dataclass
-class AudioConfig:
-    """Audio processing configuration"""
-    sample_rate: int = 16000
-    n_fft: int = 1024
-    hop_length: int = 160
-    n_mels: int = 128
-    f_min: float = 20.0
-    f_max: float = 7980.0  # sample_rate/2 - 20
+class Config:
+    """Central configuration for the entire pipeline"""
+    
+    # Paths
+    COMBINED_DIR = r"./dataset"
+    AI_DIR = os.path.join(COMBINED_DIR, "ai")
+    REAL_DIR = os.path.join(COMBINED_DIR, "real")
+    CLEAN_DIR = os.path.join(COMBINED_DIR, "clean_audio_unique")
+    IMG_DIR = os.path.join(COMBINED_DIR, "spectrogram_images_clean_unique")
+    SPLIT_DIR = os.path.join(IMG_DIR, "_splits")
+    
+    # Audio settings
+    SR = 16000
+    N_FFT = 1024
+    HOP = 160
+    N_MELS = 128
+    F_MIN = 20.0
+    F_MAX = SR / 2 - 20.0
+    
+    # Denoising settings
+    DENOISE_WIN = 1024
+    DENOISE_HOP = 256
+    DENOISE_NOISE_FRAMES = 20
+    DENOISE_THRESH_DB = 6.0
+    DENOISE_ATTEN_DB = 20.0
+    
+    # VAD settings
+    VAD_FRAME_MS = 20
+    VAD_THR_RATIO = 0.5
+    VAD_PAD_MS = 100
     
     # Preprocessing
-    pre_emphasis: float = 0.97
-    hpf_cutoff: float = 40.0
-    vad_frame_ms: int = 20
-    vad_threshold: float = 0.5
-    vad_pad_ms: int = 100
+    PRE_EMPH = 0.97
+    HPF_CUTOFF = 40.0
+    MIN_SAMPLES = HOP * 6
     
-    # Denoising
-    denoise_method: str = "auto"  # "auto", "spectral", "demucs"
-    denoise_win: int = 1024
-    denoise_hop: int = 256
-    denoise_noise_frames: int = 20
-    denoise_thresh_db: float = 6.0
-    denoise_atten_db: float = 20.0
-
-
-@dataclass
-class ModelConfig:
-    """Model training configuration"""
-    model_name: str = "efficientnet_b0"  # efficientnet_b0, resnet18, convnext_tiny, etc.
-    img_size: int = 224
-    batch_size: int = 64
-    epochs: int = 12
-    learning_rate: float = 3e-4
-    weight_decay: float = 1e-4
-    patience: int = 3
+    # Training settings
+    IMG_SIZE = 224
+    BATCH_SIZE = 64
+    NUM_WORKERS = 0  # Windows/Jupyter compatibility
+    EPOCHS = 12
+    LR = 3e-4
+    WEIGHT_DECAY = 1e-4
+    PATIENCE = 3
     
-    # Data split
-    test_size: float = 0.2
-    val_from_test: float = 0.5
-    random_seed: int = 42
+    # System
+    SEED = 42
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Training
-    num_workers: int = 0  # 0 for Windows/Jupyter stability
-    pin_memory: bool = True
-    use_amp: bool = True  # Automatic Mixed Precision
-
-
-@dataclass
-class PredictionResult:
-    """Prediction result container"""
-    file_path: str
-    prediction: str  # "AI" or "Real"
-    confidence: float
-    prob_ai: float
-    prob_real: float
-    threshold: float
+    # Audio extensions
+    AUDIO_EXTS = (".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac", ".wma",
+                  ".WAV", ".MP3", ".FLAC", ".M4A", ".OGG", ".AAC", ".WMA")
     
-    def to_dict(self) -> Dict:
-        return asdict(self)
-    
-    def __str__(self) -> str:
-        return (f"File: {Path(self.file_path).name}\n"
-                f"Prediction: {self.prediction}\n"
-                f"Confidence: {self.confidence:.2%}\n"
-                f"AI Probability: {self.prob_ai:.4f}\n"
-                f"Real Probability: {self.prob_real:.4f}")
+    @classmethod
+    def setup_environment(cls):
+        """Initialize environment settings"""
+        random.seed(cls.SEED)
+        np.random.seed(cls.SEED)
+        torch.manual_seed(cls.SEED)
+        torch.set_num_threads(4)
+        if cls.DEVICE == "cuda":
+            torch.backends.cudnn.benchmark = True
+        
+        # Create directories
+        for d in [cls.CLEAN_DIR, cls.IMG_DIR, cls.SPLIT_DIR]:
+            os.makedirs(d, exist_ok=True)
 
 
 # ============================================================================
-# Audio Processing
+# UTILITY FUNCTIONS
 # ============================================================================
 
-class AudioProcessor:
-    """Handles audio loading, preprocessing, and feature extraction"""
+class FileUtils:
+    """File and path utilities"""
     
-    def __init__(self, config: AudioConfig, device: str = "cuda"):
-        self.config = config
+    @staticmethod
+    def list_audio_files(folder: str, exts: tuple = Config.AUDIO_EXTS) -> List[str]:
+        """Recursively list all audio files in folder"""
+        files = []
+        for ext in exts:
+            files.extend(glob.glob(os.path.join(folder, f"**/*{ext}"), recursive=True))
+
+        return files
+    
+    @staticmethod
+    def unique_output_name(src_path: str) -> str:
+        """Generate unique output name: <basename>__<ext>__<hash>.wav"""
+        base, ext = os.path.splitext(os.path.basename(src_path))
+        h = hashlib.sha1(os.path.abspath(src_path).encode("utf-8")).hexdigest()[:10]
+        return f"{base}__{ext.lstrip('.').lower()}__{h}.wav"
+
+
+# ============================================================================
+# AUDIO PROCESSING
+# ============================================================================
+
+class AudioLoader:
+    """Robust audio loading with multiple fallbacks"""
+    
+    def __init__(self, target_sr: int = Config.SR, device: str = Config.DEVICE):
+        self.target_sr = target_sr
         self.device = device
-        
-        # Initialize transforms
-        self.mel_transform = torchaudio.transforms.MelSpectrogram(
-            sample_rate=config.sample_rate,
-            n_fft=config.n_fft,
-            hop_length=config.hop_length,
-            n_mels=config.n_mels,
-            f_min=config.f_min,
-            f_max=config.f_max,
-            power=2.0
-        ).to(device)
-        
-        self.amp_to_db = torchaudio.transforms.AmplitudeToDB(
-            stype="power", top_db=80
-        ).to(device)
-        
-        # Denoising setup
-        self._setup_denoising()
-    
-    def _setup_denoising(self):
-        """Initialize denoising modules"""
-        self._window = torch.hann_window(
-            self.config.denoise_win, device=self.device
-        )
-        
-        # Try to load Demucs for high-quality denoising
-        self.demucs_model = None
-        try:
-            from demucs.pretrained import get_model as demucs_get_model
-            self.demucs_model = demucs_get_model("htdemucs")
-            self.demucs_model.to(self.device).eval()
-            print("✓ Demucs loaded for high-quality denoising")
-        except Exception:
-            print("⚠ Demucs not available, using spectral gating only")
     
     @torch.no_grad()
-    def load_audio(self, path: Union[str, Path]) -> torch.Tensor:
-        """
-        Load audio from file with fallback methods
-        Returns: (1, T) tensor on device, normalized
-        """
-        path = str(path)
-        
+    def load(self, path: str) -> Optional[torch.Tensor]:
+        """Load audio with fallback methods, returns (1, T) tensor on device"""
         # Try torchaudio
-        try:
-            wav, sr = torchaudio.load(path)
-            if wav.shape[0] > 1:
-                wav = wav.mean(dim=0, keepdim=True)
-            if sr != self.config.sample_rate:
-                wav = torchaudio.functional.resample(
-                    wav, sr, self.config.sample_rate
-                )
-            wav = self._normalize(wav)
-            return wav.to(self.device)
-        except Exception:
-            pass
+       
+        wav = self._try_torchaudio(path)
+      
+        if wav is not None:
+            return wav
         
         # Try soundfile
+        wav = self._try_soundfile(path)
+        if wav is not None:
+            return wav
+        
+        # Try librosa
+        wav = self._try_librosa(path)
+        return wav
+    
+    def _try_torchaudio(self, path: str) -> Optional[torch.Tensor]:
+        try:  
+            
+            wav, sr = torchaudio.load(path)
+            return self._process_wav(wav, sr)
+        except Exception as e: 
+            return None
+    
+    def _try_soundfile(self, path: str) -> Optional[torch.Tensor]:
         try:
             y, sr = sf.read(path, dtype="float32", always_2d=False)
             if y.ndim == 2:
                 y = y.mean(axis=1)
             wav = torch.from_numpy(y).unsqueeze(0)
-            if sr != self.config.sample_rate:
-                wav = torchaudio.functional.resample(
-                    wav, sr, self.config.sample_rate
-                )
-            wav = self._normalize(wav)
-            return wav.to(self.device)
+            return self._process_wav(wav, sr)
         except Exception:
-            pass
-        
-        # Try librosa
+            return None
+    
+    def _try_librosa(self, path: str) -> Optional[torch.Tensor]:
         try:
-            y, sr = librosa.load(path, sr=self.config.sample_rate, mono=True)
+            y, sr = librosa.load(path, sr=self.target_sr, mono=True)
             wav = torch.from_numpy(y.astype(np.float32)).unsqueeze(0)
-            wav = self._normalize(wav)
-            return wav.to(self.device)
-        except Exception as e:
-            raise ValueError(f"Failed to load audio from {path}: {e}")
+            return self._normalize(wav).to(self.device)
+        except Exception:
+            return None
+    
+    def _process_wav(self, wav: torch.Tensor, sr: int) -> torch.Tensor:
+        """Process loaded waveform"""
+        if wav.shape[0] > 1:
+            wav = wav.mean(dim=0, keepdim=True)
+        if sr != self.target_sr:
+            wav = torchaudio.functional.resample(wav, sr, self.target_sr)
+        return self._normalize(wav).to(self.device)
     
     @staticmethod
     def _normalize(wav: torch.Tensor) -> torch.Tensor:
-        """Normalize audio to [-1, 1]"""
+        """Normalize waveform"""
         mx = torch.amax(torch.abs(wav))
         if mx > 0:
             wav = wav / mx
         return wav
+
+
+class AudioDenoiser:
+    """Audio denoising with spectral gating and optional Demucs"""
+    
+    def __init__(self, device: str = Config.DEVICE):
+        self.device = device
+        self.window = torch.hann_window(Config.DENOISE_WIN, device=device)
+        self.demucs_model = self._init_demucs()
+    
+    def _init_demucs(self):
+        """Initialize Demucs model if available"""
+        try:
+            from demucs.pretrained import get_model as demucs_get_model
+            model = demucs_get_model("htdemucs")
+            return model.to(self.device).eval()
+        except Exception:
+            try:
+                model = torch.hub.load("facebookresearch/demucs:main", "htdemucs")
+                return model.to(self.device).eval()
+            except Exception:
+                return None
     
     @torch.no_grad()
-    def denoise(self, wav: torch.Tensor) -> torch.Tensor:
+    def denoise(self, wav: torch.Tensor, method: str = "auto") -> torch.Tensor:
         """
-        Denoise audio using specified method
+        Denoise audio
         Args:
-            wav: (1, T) tensor
-        Returns:
-            Denoised (1, T) tensor
+            wav: (1, T) tensor on GPU
+            method: "spectral", "demucs", or "auto"
         """
-        method = self.config.denoise_method
-        
-        if method == "demucs" and self.demucs_model is not None:
-            return self._denoise_demucs(wav)
+        if method == "demucs":
+            result = self._demucs_denoise(wav)
+            if result is None:
+                raise RuntimeError("Demucs failed")
+            return result
         elif method == "spectral":
-            return self._denoise_spectral(wav)
+         
+            return self._spectral_gate(wav)
         else:  # auto
-            if self.demucs_model is not None:
-                try:
-                    return self._denoise_demucs(wav)
-                except Exception:
-                    pass
-            return self._denoise_spectral(wav)
+            result = self._demucs_denoise(wav)
+            if result is not None:
+                return result
+            return self._spectral_gate(wav)
     
     @torch.no_grad()
-    def _denoise_spectral(self, wav: torch.Tensor) -> torch.Tensor:
+    def _spectral_gate(self, wav: torch.Tensor) -> torch.Tensor:
         """Spectral gating denoising"""
         stft = torch.stft(
-            wav, 
-            n_fft=self.config.denoise_win,
-            hop_length=self.config.denoise_hop,
-            win_length=self.config.denoise_win,
-            window=self._window,
-            center=True,
-            return_complex=True
+            wav, n_fft=Config.DENOISE_WIN, hop_length=Config.DENOISE_HOP,
+            win_length=Config.DENOISE_WIN, window=self.window,
+            center=True, return_complex=True
         )
         
         mag = torch.abs(stft) + 1e-8
         phase = stft / mag
         
-        # Estimate noise from first few frames
-        N = min(self.config.denoise_noise_frames, mag.shape[-1])
+        # Estimate noise from first frames
+        N = min(Config.DENOISE_NOISE_FRAMES, mag.shape[-1])
         noise = mag[..., :N].median(dim=-1, keepdim=True).values
         
+        # Apply gate
         mag_db = 20.0 * torch.log10(mag)
         noise_db = 20.0 * torch.log10(noise + 1e-8)
-        
-        # Soft gating
-        keep = (mag_db - noise_db) >= self.config.denoise_thresh_db
-        atten = 10 ** (-self.config.denoise_atten_db / 20.0)
-        mag_clean = torch.where(keep, mag, mag * atten)
+        keep = (mag_db - noise_db) >= Config.DENOISE_THRESH_DB
+        atten = 10 ** (-Config.DENOISE_ATTEN_DB / 20.0)
+        mag_dn = torch.where(keep, mag, mag * atten)
         
         # Reconstruct
-        stft_clean = mag_clean * phase
-        wav_clean = torch.istft(
-            stft_clean,
-            n_fft=self.config.denoise_win,
-            hop_length=self.config.denoise_hop,
-            win_length=self.config.denoise_win,
-            window=self._window,
-            center=True,
-            length=wav.shape[-1]
+        stft_dn = mag_dn * phase
+        wav_out = torch.istft(
+            stft_dn, n_fft=Config.DENOISE_WIN, hop_length=Config.DENOISE_HOP,
+            win_length=Config.DENOISE_WIN, window=self.window,
+            center=True, length=wav.shape[-1]
         ).unsqueeze(0)
         
-        return self._normalize(wav_clean)
+        return AudioLoader._normalize(wav_out)
     
     @torch.no_grad()
-    def _denoise_demucs(self, wav: torch.Tensor) -> torch.Tensor:
-        """Demucs-based denoising (vocal separation)"""
-        x = wav.unsqueeze(0)  # (1, 1, T)
-        out = self.demucs_model(x)
+    def _demucs_denoise(self, wav: torch.Tensor) -> Optional[torch.Tensor]:
+        """Demucs vocal separation"""
+        if self.demucs_model is None:
+            return None
         
-        if isinstance(out, (list, tuple)):
-            out = out[0]
-        
-        # Extract vocals
-        if out.dim() == 4:
-            sources = getattr(
-                self.demucs_model, 'sources', 
-                ['drums', 'bass', 'other', 'vocals']
-            )
-            vocals_idx = sources.index('vocals') if 'vocals' in sources else -1
-            vocals = out[:, vocals_idx, 0, :]
-        elif out.dim() == 3:
-            vocals = out[-1, 0, :].unsqueeze(0)
-        else:
-            return wav
-        
-        return self._normalize(vocals)
-    @torch.no_grad()
-    def _normalize(self, wav: torch.Tensor) -> torch.Tensor:
-        """Normalize waveform amplitude safely"""
-        if wav is None or wav.numel() == 0:
-            print("[WARN] _normalize(): empty or None waveform, skipping normalization.")
-            return wav
-
-        abs_wav = torch.abs(wav)
-        if torch.all(abs_wav == 0):
-            print("[WARN] _normalize(): silent waveform, skipping normalization.")
-            return wav
-
-        mx = torch.amax(abs_wav)
-        return wav / (mx + 1e-9)
-
-    @torch.no_grad()
-    def vad_trim(self, wav: torch.Tensor) -> torch.Tensor:
-        """Voice Activity Detection trimming"""
-        T = wav.shape[-1]
-        hop = int(self.config.sample_rate * self.config.vad_frame_ms / 1000.0)
-        win = hop
-
-        if T < win:
-            return wav
-
-        frames = wav.unfold(dimension=-1, size=win, step=hop)
-        energy = (frames ** 2).mean(dim=-1).squeeze(0)
-
-        thr = torch.median(energy) * self.config.vad_threshold
-        mask = energy > thr
-
-        if not mask.any():
-            print("[WARN] vad_trim(): no active frames detected, skipping trim.")
-            return wav
-
-        idx = torch.nonzero(mask, as_tuple=False).squeeze()
-        if idx.ndim > 1:
-            idx = idx[:, -1]
-
-        start_f = idx[0].item()
-        end_f = idx[-1].item()
-
-        pad = int(self.config.sample_rate * self.config.vad_pad_ms / 1000.0)
-        start = max(0, start_f * hop - pad)
-        end = min(T, (end_f + 1) * hop + pad)
-
-        trimmed = wav[:, start:end] if end > start else wav
-
-        if trimmed.numel() == 0:
-            print("[WARN] vad_trim(): produced empty waveform, returning original.")
-            return wav
-
-        return trimmed
-
-    @torch.no_grad()
-    def preprocess(self, wav: torch.Tensor) -> Optional[torch.Tensor]:
-        """
-        Full preprocessing pipeline
-        Returns None if audio too short after processing
-        """
         try:
-            # VAD trimming
-            wav = self.vad_trim(wav)
+            x = wav.unsqueeze(0)  # (1, 1, T)
+            out = self.demucs_model(x)
             
-            # High-pass filter
-            if self.config.hpf_cutoff > 0:
-                wav = torchaudio.functional.highpass_biquad(
-                    wav, self.config.sample_rate, self.config.hpf_cutoff
-                )
+            if isinstance(out, (list, tuple)):
+                out = out[0]
             
-            # Pre-emphasis
-            if self.config.pre_emphasis > 0:
-                x_shift = torch.zeros_like(wav)
-                x_shift[..., 1:] = wav[..., :-1]
-                wav = wav - self.config.pre_emphasis * x_shift
-            
-            wav = self._normalize(wav)
-            
-            # Check minimum length
-            min_samples = self.config.hop_length * 6
-            if wav.shape[-1] < min_samples:
+            if out.dim() == 4:
+                sources = getattr(self.demucs_model, "sources", ['drums','bass','other','vocals'])
+                vocals_idx = sources.index('vocals') if 'vocals' in sources else -1
+                vocals = out[:, vocals_idx, 0, :]
+            elif out.dim() == 3:
+                vocals = out[-1, 0, :].unsqueeze(0)
+            else:
                 return None
             
-            return wav
+            return AudioLoader._normalize(vocals)
         except Exception:
-            pass
-    @torch.no_grad()
-    def wav_to_mel_spectrogram(self, wav: torch.Tensor) -> torch.Tensor:
-        """
-        Convert waveform to mel spectrogram image tensor
-        Returns: (1, H, W) tensor normalized to [0, 1]
-        """
-        S = self.mel_transform(wav)  # (1, n_mels, frames)
-        S_db = self.amp_to_db(S).squeeze(0)  # (n_mels, frames)
-        
-        # Min-max normalization
-        S_norm = (S_db - S_db.amin()) / (S_db.amax() - S_db.amin() + 1e-8)
-        
-        return S_norm.unsqueeze(0)  # (1, n_mels, frames)
+            return None
+
+
+class AudioPreprocessor:
+    """Audio preprocessing: VAD, HPF, pre-emphasis"""
+    
+    def __init__(self, sr: int = Config.SR, device: str = Config.DEVICE):
+        self.sr = sr
+        self.device = device
     
     @torch.no_grad()
-    def audio_to_model_input(
-        self, 
-        wav: torch.Tensor, 
-        img_size: int = 224
-    ) -> torch.Tensor:
-        """
-        Full pipeline: waveform -> model-ready tensor
-        Returns: (1, 1, img_size, img_size) normalized tensor
-        """
-        # Get mel spectrogram
-        spec = self.wav_to_mel_spectrogram(wav)  # (1, H, W)
+    def process(self, wav: torch.Tensor) -> Optional[torch.Tensor]:
+        """Full preprocessing pipeline"""
+        # VAD trimming
+        wav = self._vad_trim(wav)
         
-        # Convert to PIL for resizing
-        spec_np = (spec.squeeze(0) * 255).clamp(0, 255).to(torch.uint8)
-        spec_np = spec_np.detach().cpu().numpy()
-        pil_img = Image.fromarray(spec_np, mode='L')
-        pil_img = pil_img.resize((img_size, img_size), Image.BILINEAR)
+        # High-pass filter
+        if Config.HPF_CUTOFF > 0:
+            wav = torchaudio.functional.highpass_biquad(wav, self.sr, Config.HPF_CUTOFF)
         
-        # Back to tensor and normalize (mean=0.5, std=0.5 as in training)
-        img_tensor = torch.from_numpy(np.array(pil_img)).float()
-        img_tensor = img_tensor.unsqueeze(0).unsqueeze(0) / 255.0  # (1, 1, H, W)
-        img_tensor = (img_tensor - 0.5) / 0.5
+        # Pre-emphasis
+        if Config.PRE_EMPH > 0:
+            wav = self._pre_emphasize(wav)
         
-        return img_tensor.to(self.device)
+        # Normalize
+        wav = AudioLoader._normalize(wav)
+        
+        # Check length
+        if wav.shape[-1] < Config.MIN_SAMPLES:
+            return None
+        
+        return wav
+    
+    @torch.no_grad()
+    def _vad_trim(self, wav: torch.Tensor) -> torch.Tensor:
+        """Simple VAD-based trimming"""
+        T = wav.shape[-1]
+        hop = int(self.sr * Config.VAD_FRAME_MS / 1000.0)
+        win = hop
+        
+        if T < win:
+            return wav
+        
+        frames = wav.unfold(dimension=-1, size=win, step=hop)
+        energy = (frames ** 2).mean(dim=-1).squeeze(0)
+        thr = torch.median(energy) * Config.VAD_THR_RATIO
+        mask = energy > thr
+        
+        if not mask.any():
+            return wav
+        
+        idx = torch.nonzero(mask, as_tuple=False).squeeze(1)
+        start_f, end_f = idx[0].item(), idx[-1].item()
+        pad = int(self.sr * Config.VAD_PAD_MS / 1000.0)
+        start = max(0, start_f * hop - pad)
+        end = min(T, (end_f + 1) * hop + pad)
+        
+        return wav[:, start:end] if end > start else wav
+    
+    @staticmethod
+    def _pre_emphasize(wav: torch.Tensor) -> torch.Tensor:
+        """Apply pre-emphasis filter"""
+        x_shift = torch.zeros_like(wav)
+        x_shift[..., 1:] = wav[..., :-1]
+        return wav - Config.PRE_EMPH * x_shift
+
+
+class SpectrogramGenerator:
+    """Generate mel spectrograms from audio"""
+    
+    def __init__(self, device: str = Config.DEVICE):
+        self.device = device
+        self.mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=Config.SR, n_fft=Config.N_FFT, hop_length=Config.HOP,
+            n_mels=Config.N_MELS, f_min=Config.F_MIN, f_max=Config.F_MAX,
+            power=2.0
+        ).to(device)
+        self.amp2db = torchaudio.transforms.AmplitudeToDB(
+            stype="power", top_db=80
+        ).to(device)
+    
+    @torch.no_grad()
+    def generate(self, wav: torch.Tensor) -> np.ndarray:
+        """Generate mel spectrogram image (uint8 numpy array)"""
+        S = self.mel_transform(wav)
+        S_db = self.amp2db(S).squeeze(0)
+        
+        # Normalize to [0, 255]
+        a = (S_db - S_db.amin()) / (S_db.amax() - S_db.amin() + 1e-8)
+        a = (a * 255.0).clamp(0, 255).to(torch.uint8)
+        
+        return a.detach().cpu().numpy()
+    
+    @torch.no_grad()
+    def wav_to_tensor(self, wav: torch.Tensor, img_size: int = Config.IMG_SIZE) -> torch.Tensor:
+        """Generate normalized tensor for model input (1, 1, H, W)"""
+        img_array = self.generate(wav)
+        pil_img = Image.fromarray(img_array).resize(
+            (img_size, img_size), Image.BILINEAR
+        )
+        x = torch.from_numpy(np.array(pil_img)).float()
+        x = x.unsqueeze(0).unsqueeze(0) / 255.0  # (1, 1, H, W)
+        x = (x - 0.5) / 0.5  # Normalize like training
+        return x.to(self.device)
 
 
 # ============================================================================
-# Dataset
+# DATASET AND DATA PROCESSING
 # ============================================================================
 
 class SpectrogramDataset(Dataset):
-    """Dataset for loading spectrogram images"""
+    """Dataset for spectrogram images"""
     
-    def __init__(
-        self, 
-        csv_path: Union[str, Path],
-        img_size: int = 224,
-        augment: bool = False
-    ):
-        self.df = pd.read_csv(csv_path)
+    def __init__(self, csv_path: str, augment: bool = False, 
+                 img_size: int = Config.IMG_SIZE):
+        df = pd.read_csv(csv_path)
+        self.paths = df["path"].tolist()
+        self.labels = df["label"].astype(int).tolist()
         self.img_size = img_size
-        self.augment = augment
-        
-        import torchvision.transforms as T
         
         if augment:
             self.transform = T.Compose([
                 T.Resize((img_size, img_size)),
                 T.RandomApply([
-                    T.RandomAffine(
-                        degrees=5, 
-                        translate=(0.02, 0.02),
-                        scale=(0.98, 1.02)
-                    )
+                    T.RandomAffine(degrees=5, translate=(0.02, 0.02), 
+                                  scale=(0.98, 1.02))
                 ], p=0.5),
                 T.ToTensor(),
                 T.Normalize(mean=[0.5], std=[0.5]),
@@ -477,1065 +453,861 @@ class SpectrogramDataset(Dataset):
             ])
     
     def __len__(self) -> int:
-        return len(self.df)
+        return len(self.paths)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        row = self.df.iloc[idx]
-        
         try:
-            img = Image.open(row['path']).convert('L')
+            img = Image.open(self.paths[idx]).convert("L")
             x = self.transform(img)
         except Exception:
-            # Fallback: return black image
-            x = torch.zeros(1, self.img_size, self.img_size)
+            # Fallback: return zeros to avoid blocking
+            x = torch.zeros(1, self.img_size, self.img_size, dtype=torch.float32)
         
-        return x, int(row['label'])
+        return x, self.labels[idx]
 
 
-# ============================================================================
-# Model Factory
-# ============================================================================
-
-class ModelFactory:
-    """Factory for creating models"""
+class DatasetBuilder:
+    """Build and manage datasets"""
     
-    @staticmethod
-    def create(
-        name: str, 
-        num_classes: int = 2,
-        pretrained: bool = False
-    ) -> nn.Module:
-        """Create model by name"""
-        
-        from torchvision.models import (
-            resnet18, efficientnet_b0, convnext_tiny,
-            densenet121, mobilenet_v3_small, vit_b_16, swin_t
-        )
-        
-        name = name.lower()
-        
-        if name == "resnet18":
-            model = resnet18(weights='DEFAULT' if pretrained else None)
-            model.conv1 = nn.Conv2d(1, 64, 7, stride=2, padding=3, bias=False)
-            model.fc = nn.Linear(model.fc.in_features, num_classes)
-        
-        elif name == "efficientnet_b0":
-            model = efficientnet_b0(weights='DEFAULT' if pretrained else None)
-            first = model.features[0][0]
-            model.features[0][0] = nn.Conv2d(
-                1, first.out_channels, 
-                kernel_size=first.kernel_size,
-                stride=first.stride, padding=first.padding, 
-                bias=(first.bias is not None)
-            )
-            in_feats = model.classifier[-1].in_features
-            model.classifier[-1] = nn.Linear(in_feats, num_classes)
-        
-        elif name == "convnext_tiny":
-            model = convnext_tiny(weights='DEFAULT' if pretrained else None)
-            model.features[0][0] = nn.Conv2d(1, 96, 4, stride=4, bias=True)
-            model.classifier[2] = nn.Linear(
-                model.classifier[2].in_features, num_classes
-            )
-        
-        elif name == "densenet121":
-            model = densenet121(weights='DEFAULT' if pretrained else None)
-            first = model.features.conv0
-            model.features.conv0 = nn.Conv2d(
-                1, first.out_channels,
-                kernel_size=first.kernel_size,
-                stride=first.stride, padding=first.padding,
-                bias=(first.bias is not None)
-            )
-            model.classifier = nn.Linear(
-                model.classifier.in_features, num_classes
-            )
-        
-        elif name == "mobilenet_v3_small":
-            model = mobilenet_v3_small(weights='DEFAULT' if pretrained else None)
-            first = model.features[0][0]
-            model.features[0][0] = nn.Conv2d(
-                1, first.out_channels,
-                kernel_size=first.kernel_size,
-                stride=first.stride, padding=first.padding,
-                bias=(first.bias is not None)
-            )
-            in_feats = model.classifier[-1].in_features
-            model.classifier[-1] = nn.Linear(in_feats, num_classes)
-        
-        elif name == "vit_b_16":
-            model = vit_b_16(weights='DEFAULT' if pretrained else None)
-            embed_dim = model.conv_proj.out_channels
-            model.conv_proj = nn.Conv2d(1, embed_dim, 16, stride=16, bias=True)
-            try:
-                in_features = model.heads.head.in_features
-                model.heads.head = nn.Linear(in_features, num_classes)
-            except:
-                last = list(model.heads.children())[-1]
-                model.heads = nn.Sequential(nn.Linear(last.in_features, num_classes))
-        
-        elif name == "swin_t":
-            model = swin_t(weights='DEFAULT' if pretrained else None)
-            old = model.features[0][0]
-            model.features[0][0] = nn.Conv2d(
-                1, old.out_channels,
-                kernel_size=old.kernel_size,
-                stride=old.stride, padding=old.padding,
-                bias=(old.bias is not None)
-            )
-            model.head = nn.Linear(model.head.in_features, num_classes)
-        
-        else:
-            raise ValueError(f"Unknown model: {name}")
-        
-        return model
-
-
-# ============================================================================
-# Trainer
-# ============================================================================
-
-class Trainer:
-    """Model training and evaluation"""
+    def __init__(self, base_dir: str = Config.IMG_DIR):
+        self.base_dir = base_dir
+        self.split_dir = os.path.join(base_dir, "_splits")
+        os.makedirs(self.split_dir, exist_ok=True)
     
-    def __init__(
-        self,
-        model: nn.Module,
-        config: ModelConfig,
-        device: str = "cuda"
-    ):
-        self.model = model.to(device)
-        self.config = config
-        self.device = device
-        
-        self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay
-        )
-        
-        self.scaler = torch.amp.GradScaler(
-            'cuda', enabled=(device == "cuda" and config.use_amp)
-        )
-        
-        self.best_val_acc = 0.0
-        self.patience_counter = 0
-        self.history = {'train_loss': [], 'train_acc': [], 
-                       'val_loss': [], 'val_acc': []}
-    
-    def train_epoch(self, loader: DataLoader) -> Tuple[float, float]:
-        """Train for one epoch"""
-        self.model.train()
-        total_loss, correct, total = 0.0, 0, 0
-        
-        pbar = tqdm(loader, desc="Training", leave=False)
-        for x, y in pbar:
-            x = x.to(self.device, non_blocking=True)
-            y = y.to(self.device, non_blocking=True)
-            
-            self.optimizer.zero_grad(set_to_none=True)
-            
-            with torch.amp.autocast(
-                device_type='cuda', 
-                enabled=(self.device == "cuda" and self.config.use_amp)
-            ):
-                logits = self.model(x)
-                loss = self.criterion(logits, y)
-            
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            
-            total_loss += loss.item() * x.size(0)
-            preds = logits.argmax(1)
-            correct += (preds == y).sum().item()
-            total += x.size(0)
-            
-            pbar.set_postfix({
-                'loss': total_loss / total,
-                'acc': correct / total
-            })
-        
-        return total_loss / total, correct / total
-    
-    @torch.no_grad()
-    def validate(self, loader: DataLoader) -> Tuple[float, float, np.ndarray, np.ndarray]:
-        """Validate model"""
-        self.model.eval()
-        total_loss, correct, total = 0.0, 0, 0
-        all_probs, all_targets = [], []
-        
-        for x, y in tqdm(loader, desc="Validating", leave=False):
-            x = x.to(self.device, non_blocking=True)
-            y = y.to(self.device, non_blocking=True)
-            
-            with torch.amp.autocast(
-                device_type='cuda',
-                enabled=(self.device == "cuda" and self.config.use_amp)
-            ):
-                logits = self.model(x)
-                loss = self.criterion(logits, y)
-            
-            probs = F.softmax(logits, dim=1)[:, 1]
-            
-            total_loss += loss.item() * x.size(0)
-            preds = logits.argmax(1)
-            correct += (preds == y).sum().item()
-            total += x.size(0)
-            
-            all_probs.append(probs.cpu().numpy())
-            all_targets.append(y.cpu().numpy())
-        
-        avg_loss = total_loss / total
-        accuracy = correct / total
-        probs = np.concatenate(all_probs)
-        targets = np.concatenate(all_targets)
-        
-        return avg_loss, accuracy, probs, targets
-    
-    def fit(
-        self,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        save_path: Union[str, Path]
-    ):
-        """Full training loop"""
-        print(f"\n{'='*60}")
-        print(f"Training {self.config.model_name}")
-        print(f"{'='*60}\n")
-        
-        for epoch in range(1, self.config.epochs + 1):
-            # Train
-            train_loss, train_acc = self.train_epoch(train_loader)
-            
-            # Validate
-            val_loss, val_acc, _, _ = self.validate(val_loader)
-            
-            # Update history
-            self.history['train_loss'].append(train_loss)
-            self.history['train_acc'].append(train_acc)
-            self.history['val_loss'].append(val_loss)
-            self.history['val_acc'].append(val_acc)
-            
-            print(f"Epoch {epoch:02d}/{self.config.epochs} | "
-                  f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
-                  f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f}")
-            
-            # Save best model
-            if val_acc > self.best_val_acc:
-                self.best_val_acc = val_acc
-                self.patience_counter = 0
-                torch.save(self.model.state_dict(), save_path)
-                print(f"  ✓ Saved best model (acc: {val_acc:.4f})")
-            else:
-                self.patience_counter += 1
-                
-            # Early stopping
-            if self.patience_counter >= self.config.patience:
-                print(f"\nEarly stopping triggered (patience: {self.config.patience})")
-                break
-        
-        print(f"\nTraining complete! Best val acc: {self.best_val_acc:.4f}")
-    
-    def plot_history(self, save_path: Optional[Union[str, Path]] = None):
-        """Plot training history"""
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-        
-        epochs = range(1, len(self.history['train_loss']) + 1)
-        
-        # Loss
-        ax1.plot(epochs, self.history['train_loss'], 'b-', label='Train')
-        ax1.plot(epochs, self.history['val_loss'], 'r-', label='Val')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Loss')
-        ax1.set_title('Training & Validation Loss')
-        ax1.legend()
-        ax1.grid(alpha=0.3)
-        
-        # Accuracy
-        ax2.plot(epochs, self.history['train_acc'], 'b-', label='Train')
-        ax2.plot(epochs, self.history['val_acc'], 'r-', label='Val')
-        ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('Accuracy')
-        ax2.set_title('Training & Validation Accuracy')
-        ax2.legend()
-        ax2.grid(alpha=0.3)
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.show()
-
-
-# ============================================================================
-# Main Interface
-# ============================================================================
-
-class VoiceDetector:
-    """
-    Main interface for AI voice detection
-    
-    Example:
-        # Training
-        detector = VoiceDetector(model_name='efficientnet_b0')
-        detector.prepare_dataset('ai_folder', 'real_folder', 'output_dir')
-        detector.train()
-        
-        # Inference
-        result = detector.predict('audio.wav')
-        print(result)
-    """
-    
-    def __init__(
-        self,
-        model_name: str = "efficientnet_b0",
-        device: Optional[str] = None,
-        audio_config: Optional[AudioConfig] = None,
-        model_config: Optional[ModelConfig] = None
-    ):
-        """
-        Initialize detector
-        
-        Args:
-            model_name: Model architecture name
-            device: 'cuda' or 'cpu', auto-detected if None
-            audio_config: Audio processing config
-            model_config: Model training config
-        """
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {self.device}")
-        
-        self.audio_config = audio_config or AudioConfig()
-        self.model_config = model_config or ModelConfig(model_name=model_name)
-        
-        self.audio_processor = AudioProcessor(self.audio_config, self.device)
-        self.model = None
-        self.threshold = 0.5
-        
-        self.output_dir = None
-        self.splits_dir = None
-        self.models_dir = None
-    
-    def prepare_dataset(
-        self,
-        ai_folder: Union[str, Path],
-        real_folder: Union[str, Path],
-        output_dir: Union[str, Path],
-        denoise: bool = True,
-        force_rebuild: bool = False
-    ):
-        """
-        Prepare dataset from raw audio files
-        
-        Args:
-            ai_folder: Path to AI voice samples
-            real_folder: Path to real voice samples
-            output_dir: Output directory for processed data
-            denoise: Whether to denoise audio
-            force_rebuild: Force rebuild even if exists
-        """
-        print("\n" + "="*60)
-        print("DATASET PREPARATION")
-        print("="*60 + "\n")
-        
-        self.output_dir = Path(output_dir)
-        clean_audio_dir = self.output_dir / "clean_audio"
-        spectrogram_dir = self.output_dir / "spectrograms"
-        self.splits_dir = self.output_dir / "splits"
-        self.models_dir = self.output_dir / "models"
-        
-        for d in [clean_audio_dir, spectrogram_dir, self.splits_dir, self.models_dir]:
-            d.mkdir(parents=True, exist_ok=True)
-        
-        ai_clean_dir = clean_audio_dir / "ai"
-        real_clean_dir = clean_audio_dir / "real"
-        ai_spec_dir = spectrogram_dir / "ai"
-        real_spec_dir = spectrogram_dir / "real"
-        
-        for d in [ai_clean_dir, real_clean_dir, ai_spec_dir, real_spec_dir]:
-            d.mkdir(parents=True, exist_ok=True)
-        
-        # Step 1: Process audio files
-        if force_rebuild or not list(ai_clean_dir.glob("*.wav")):
-            print("Step 1: Processing audio files...")
-            self._process_audio_folder(
-                ai_folder, ai_clean_dir, denoise, "AI"
-            )
-            self._process_audio_folder(
-                real_folder, real_clean_dir, denoise, "Real"
-            )
-        else:
-            print("Step 1: Using existing audio files")
-        
-        # Step 2: Create spectrograms
-        if force_rebuild or not list(ai_spec_dir.glob("*.png")):
-            print("\nStep 2: Creating spectrograms...")
-            self._create_spectrograms(ai_clean_dir, ai_spec_dir, "AI")
-            self._create_spectrograms(real_clean_dir, real_spec_dir, "Real")
-        else:
-            print("\nStep 2: Using existing spectrograms")
-        
-        # Step 3: Create splits
-        print("\nStep 3: Creating train/val/test splits...")
-        self._create_splits(ai_spec_dir, real_spec_dir)
-        
-        print("\n✓ Dataset preparation complete!")
-        print(f"  Output directory: {self.output_dir}")
-        print(f"  Splits saved to: {self.splits_dir}")
-    
-
-    def _process_audio_folder(
-        self,
-        input_dir: Union[str, Path],
-        output_dir: Path,
-        denoise: bool,
-        label: str
-    ):
-        """Process all audio files in a folder (verbose mode with detailed error logs)"""
-        audio_files = self._list_audio_files(input_dir)
-        print(f"\n[INFO] Found {len(audio_files)} {label} files in '{input_dir}'")
-
-        skipped = 0
-        processed = 0
-
-        for audio_path in tqdm(audio_files, desc=f"Processing {label}"):
-            output_path = output_dir / f"{Path(audio_path).stem}.wav"
-
-            try:
-                print(f"\n--- Processing file: {audio_path}")
-                if output_path.exists():
-                    print(f"[SKIP] Output already exists → {output_path}")
-                    continue
-
-                # Load audio
-                print("[STEP] Loading audio...")
-                wav = self.audio_processor.load_audio(audio_path)
-                print(f"[OK] Loaded waveform shape: {getattr(wav, 'shape', 'unknown')}")
-
-                # Optional denoising
-                if denoise:
-                    print("[STEP] Applying denoising...")
-                    wav = self.audio_processor.denoise(wav)
-                    print("[OK] Denoising completed.")
-
-                # Preprocessing
-                print("[STEP] Preprocessing audio...")
-                wav = self.audio_processor.preprocess(wav)
-
-                if wav is None:
-                    skipped += 1
-                    print("[WARN] Skipped: preprocessing returned None.")
-                    continue
-
-                # Convert to numpy and save
-                wav_np = wav.squeeze(0).cpu().numpy()
-                sf.write(
-                    str(output_path),
-                    wav_np,
-                    self.audio_config.sample_rate,
-                    subtype='PCM_16'
-                )
-                processed += 1
-                print(f"[OK] Saved processed file → {output_path}")
-
-            except Exception as e:
-                skipped += 1
-                print(f"\n[ERROR] Exception while processing {audio_path}")
-                print(f"  → {type(e).__name__}: {e}")
-                print("  --- Full Traceback ---")
-                traceback.print_exc()  # shows the complete traceback in the console
-                print("  ----------------------")
-
-        print(f"\n[SUMMARY] {label} folder:")
-        print(f"  Total files: {len(audio_files)}")
-        print(f"  Successfully processed: {processed}")
-        print(f"  Skipped: {skipped}")
-        print(f"  Output directory: {output_dir}\n")
-    def _create_spectrograms(
-        self,
-        input_dir: Path,
-        output_dir: Path,
-        label: str
-    ):
-        """Create spectrogram images from audio files"""
-        wav_files = list(input_dir.glob("*.wav"))
-        print(f"  Creating {len(wav_files)} {label} spectrograms...")
-        
-        skipped = 0
-        for wav_path in tqdm(wav_files, desc=f"  {label}"):
-            output_path = output_dir / f"{wav_path.stem}.png"
-            
-            if output_path.exists():
-                continue
-            
-            try:
-                wav = self.audio_processor.load_audio(wav_path)
-                spec = self.audio_processor.wav_to_mel_spectrogram(wav)
-                
-                # Convert to uint8 image
-                spec_np = (spec.squeeze(0) * 255).clamp(0, 255)
-                spec_np = spec_np.to(torch.uint8).cpu().numpy()
-                
-                img = Image.fromarray(spec_np, mode='L')
-                img.save(output_path, 'PNG')
-            except Exception:
-                skipped += 1
-        
-        print(f"    Created: {len(wav_files) - skipped}, Skipped: {skipped}")
-    
-    def _create_splits(self, ai_dir: Path, real_dir: Path):
+    def create_splits(self, test_size: float = 0.2, val_size: float = 0.5):
         """Create train/val/test splits"""
-        ai_files = sorted(ai_dir.glob("*.png"))
-        real_files = sorted(real_dir.glob("*.png"))
+        ai_files = FileUtils.list_audio_files(os.path.join(self.base_dir, "ai"))
+        real_files = FileUtils.list_audio_files(os.path.join(self.base_dir, "real"))
         
-        paths = [str(f) for f in ai_files + real_files]
+        # Filter only PNG files
+        ai_files = [f for f in ai_files if f.endswith('.png')]
+        real_files = [f for f in real_files if f.endswith('.png')]
+        
+        paths = ai_files + real_files
         labels = [1] * len(ai_files) + [0] * len(real_files)
-        
-        # 80/10/10 split
+      
+        # Stratified split
         train_paths, temp_paths, train_labels, temp_labels = train_test_split(
-            paths, labels,
-            test_size=self.model_config.test_size,
-            random_state=self.model_config.random_seed,
+            paths, labels, test_size=test_size, random_state=Config.SEED,
             stratify=labels
         )
-        
         val_paths, test_paths, val_labels, test_labels = train_test_split(
-            temp_paths, temp_labels,
-            test_size=self.model_config.val_from_test,
-            random_state=self.model_config.random_seed,
-            stratify=temp_labels
+            temp_paths, temp_labels, test_size=val_size,
+            random_state=Config.SEED, stratify=temp_labels
         )
         
         # Save CSVs
-        for name, p, l in [
-            ('train', train_paths, train_labels),
-            ('val', val_paths, val_labels),
-            ('test', test_paths, test_labels)
-        ]:
-            df = pd.DataFrame({'path': p, 'label': l})
-            df.to_csv(self.splits_dir / f"{name}.csv", index=False)
+        self._save_split("train", train_paths, train_labels)
+        self._save_split("val", val_paths, val_labels)
+        self._save_split("test", test_paths, test_labels)
         
-        print(f"    Train: {len(train_paths)} | Val: {len(val_paths)} | Test: {len(test_paths)}")
+        print(f"Splits created: Train={len(train_paths)}, "
+              f"Val={len(val_paths)}, Test={len(test_paths)}")
     
-    @staticmethod
-    def _list_audio_files(folder: Union[str, Path]) -> List[Path]:
-        """List all audio files in folder"""
-        folder = Path(folder)
-        exts = ['.wav', '.mp3', '.flac', '.m4a', '.ogg', '.aac', '.wma']
-        files = []
-        for ext in exts:
-            files.extend(folder.rglob(f"*{ext}"))
-            files.extend(folder.rglob(f"*{ext.upper()}"))
-        return sorted(set(files))
+    def _save_split(self, name: str, paths: List[str], labels: List[int]):
+        """Save split to CSV"""
+        df = pd.DataFrame({"path": paths, "label": labels})
+        df.to_csv(os.path.join(self.split_dir, f"{name}.csv"), index=False)
     
-    def train(self, resume: bool = False):
-        """
-        Train the model
-        
-        Args:
-            resume: Resume from checkpoint if exists
-        """
-        if self.splits_dir is None:
-            raise ValueError("Call prepare_dataset() first")
-        
-        print("\n" + "="*60)
-        print(f"TRAINING {self.model_config.model_name.upper()}")
-        print("="*60 + "\n")
-        
-        # Create dataloaders
+    def get_dataloaders(self, batch_size: int = Config.BATCH_SIZE,
+                       num_workers: int = Config.NUM_WORKERS) -> Dict[str, DataLoader]:
+        """Get train/val/test dataloaders"""
         train_ds = SpectrogramDataset(
-            self.splits_dir / "train.csv",
-            img_size=self.model_config.img_size,
-            augment=True
+            os.path.join(self.split_dir, "train.csv"), augment=True
         )
         val_ds = SpectrogramDataset(
-            self.splits_dir / "val.csv",
-            img_size=self.model_config.img_size,
-            augment=False
+            os.path.join(self.split_dir, "val.csv"), augment=False
         )
-        
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=self.model_config.batch_size,
-            shuffle=True,
-            num_workers=self.model_config.num_workers,
-            pin_memory=self.model_config.pin_memory and (self.device == "cuda")
-        )
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=self.model_config.batch_size,
-            shuffle=False,
-            num_workers=self.model_config.num_workers,
-            pin_memory=self.model_config.pin_memory and (self.device == "cuda")
-        )
-        
-        # Create model
-        self.model = ModelFactory.create(self.model_config.model_name)
-        
-        model_path = self.models_dir / f"best_{self.model_config.model_name}.pt"
-        
-        if resume and model_path.exists():
-            print(f"Resuming from {model_path}")
-            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
-        
-        # Train
-        trainer = Trainer(self.model, self.model_config, self.device)
-        trainer.fit(train_loader, val_loader, model_path)
-        
-        # Plot history
-        history_plot = self.models_dir / f"{self.model_config.model_name}_history.png"
-        trainer.plot_history(history_plot)
-        
-        # Load best model
-        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
-        self.model.eval()
-        
-        print(f"\n✓ Model saved to: {model_path}")
-    
-    def tune_threshold(self) -> float:
-        """
-        Tune decision threshold on validation set using Youden's J statistic
-        
-        Returns:
-            Optimal threshold
-        """
-        if self.model is None:
-            raise ValueError("Train or load model first")
-        
-        print("\nTuning threshold on validation set...")
-        
-        val_ds = SpectrogramDataset(
-            self.splits_dir / "val.csv",
-            img_size=self.model_config.img_size,
-            augment=False
-        )
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=self.model_config.batch_size,
-            shuffle=False,
-            num_workers=0
-        )
-        
-        # Collect predictions
-        all_probs, all_targets = [], []
-        self.model.eval()
-        
-        with torch.no_grad():
-            for x, y in tqdm(val_loader, desc="Evaluating"):
-                x = x.to(self.device)
-                logits = self.model(x)
-                probs = F.softmax(logits, dim=1)[:, 1]
-                
-                all_probs.append(probs.cpu().numpy())
-                all_targets.append(y.numpy())
-        
-        probs = np.concatenate(all_probs)
-        targets = np.concatenate(all_targets)
-        
-        # Find optimal threshold (Youden's J)
-        fpr, tpr, thresholds = roc_curve(targets, probs)
-        j_scores = tpr - fpr
-        best_idx = np.argmax(j_scores)
-        self.threshold = float(thresholds[best_idx])
-        
-        print(f"✓ Optimal threshold: {self.threshold:.4f}")
-        print(f"  TPR: {tpr[best_idx]:.4f}, FPR: {fpr[best_idx]:.4f}")
-        
-        return self.threshold
-    
-    def evaluate(self, plot: bool = True) -> Dict:
-        """
-        Evaluate model on test set
-        
-        Args:
-            plot: Whether to plot ROC and confusion matrix
-            
-        Returns:
-            Dictionary with evaluation metrics
-        """
-        if self.model is None:
-            raise ValueError("Train or load model first")
-        
-        print("\n" + "="*60)
-        print("EVALUATION ON TEST SET")
-        print("="*60 + "\n")
-        
         test_ds = SpectrogramDataset(
-            self.splits_dir / "test.csv",
-            img_size=self.model_config.img_size,
-            augment=False
-        )
-        test_loader = DataLoader(
-            test_ds,
-            batch_size=self.model_config.batch_size,
-            shuffle=False,
-            num_workers=0
+            os.path.join(self.split_dir, "test.csv"), augment=False
         )
         
-        # Collect predictions
-        all_probs, all_targets = [], []
-        self.model.eval()
-        
-        with torch.no_grad():
-            for x, y in tqdm(test_loader, desc="Testing"):
-                x = x.to(self.device)
-                logits = self.model(x)
-                probs = F.softmax(logits, dim=1)[:, 1]
-                
-                all_probs.append(probs.cpu().numpy())
-                all_targets.append(y.numpy())
-        
-        probs = np.concatenate(all_probs)
-        targets = np.concatenate(all_targets)
-        preds = (probs >= self.threshold).astype(int)
-        
-        # Calculate metrics
-        accuracy = (preds == targets).mean()
-        roc_auc = roc_auc_score(targets, probs)
-        
-        print(f"Threshold: {self.threshold:.4f}")
-        print(f"Accuracy: {accuracy:.4f}")
-        print(f"ROC-AUC: {roc_auc:.6f}")
-        print("\n" + classification_report(
-            targets, preds, 
-            target_names=['Real', 'AI']
-        ))
-        
-        cm = confusion_matrix(targets, preds)
-        print("Confusion Matrix:")
-        print(f"              Predicted")
-        print(f"           Real    AI")
-        print(f"Actual Real  {cm[0,0]:<6} {cm[0,1]:<6}")
-        print(f"       AI    {cm[1,0]:<6} {cm[1,1]:<6}")
-        
-        # Plot
-        if plot:
-            self._plot_evaluation(targets, probs, preds)
+        pin_memory = Config.DEVICE == "cuda"
         
         return {
-            'accuracy': accuracy,
-            'roc_auc': roc_auc,
-            'confusion_matrix': cm.tolist(),
-            'threshold': self.threshold
+            "train": DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=num_workers, pin_memory=pin_memory),
+            "val": DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=pin_memory),
+            "test": DataLoader(test_ds, batch_size=batch_size, shuffle=False,
+                             num_workers=num_workers, pin_memory=pin_memory),
+        }
+
+
+# ============================================================================
+# MODELS
+# ============================================================================
+
+class ModelFactory:
+    """Factory for creating different model architectures"""
+    
+    @staticmethod
+    def create_model(name: str) -> nn.Module:
+        """Create model by name"""
+        name = name.lower()
+        
+        if name == "resnet18":
+            return ModelFactory._create_resnet18()
+        elif name == "efficientnet_b0":
+            return ModelFactory._create_efficientnet_b0()
+        elif name == "efficientnet_b1":
+            return ModelFactory._create_efficientnet_b1()
+        elif name == "densenet121":
+            return ModelFactory._create_densenet121()
+        elif name == "densenet169":
+            return ModelFactory._create_densenet169()
+        elif name == "mobilenet_v3_small":
+            return ModelFactory._create_mobilenet_v3_small()
+        elif name == "convnext_tiny":
+            return ModelFactory._create_convnext_tiny()
+        elif name == "vit_b16":
+            return ModelFactory._create_vit_b16()
+        elif name == "swin_tiny":
+            return ModelFactory._create_swin_tiny()
+        else:
+            raise ValueError(f"Unknown model: {name}")
+    
+    @staticmethod
+    def _create_resnet18() -> nn.Module:
+        model = resnet18(weights=None)
+        model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        model.fc = nn.Linear(model.fc.in_features, 2)
+        return model
+    
+    @staticmethod
+    def _create_efficientnet_b0() -> nn.Module:
+        model = efficientnet_b0(weights=None)
+        first = model.features[0][0]
+        model.features[0][0] = nn.Conv2d(
+            1, first.out_channels, kernel_size=first.kernel_size,
+            stride=first.stride, padding=first.padding, bias=(first.bias is not None)
+        )
+        model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, 2)
+        return model
+    
+    @staticmethod
+    def _create_efficientnet_b1() -> nn.Module:
+        model = efficientnet_b1(weights=None)
+        first = model.features[0][0]
+        model.features[0][0] = nn.Conv2d(
+            1, first.out_channels, kernel_size=first.kernel_size,
+            stride=first.stride, padding=first.padding, bias=(first.bias is not None)
+        )
+        model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, 2)
+        return model
+    
+    @staticmethod
+    def _create_densenet121() -> nn.Module:
+        model = densenet121(weights=None)
+        first = model.features.conv0
+        model.features.conv0 = nn.Conv2d(
+            1, first.out_channels, kernel_size=first.kernel_size,
+            stride=first.stride, padding=first.padding, bias=(first.bias is not None)
+        )
+        model.classifier = nn.Linear(model.classifier.in_features, 2)
+        return model
+    
+    @staticmethod
+    def _create_densenet169() -> nn.Module:
+        model = densenet169(weights=None)
+        first = model.features.conv0
+        model.features.conv0 = nn.Conv2d(
+            1, first.out_channels, kernel_size=first.kernel_size,
+            stride=first.stride, padding=first.padding, bias=(first.bias is not None)
+        )
+        model.classifier = nn.Linear(model.classifier.in_features, 2)
+        return model
+    
+    @staticmethod
+    def _create_mobilenet_v3_small() -> nn.Module:
+        model = mobilenet_v3_small(weights=None)
+        first = model.features[0][0]
+        model.features[0][0] = nn.Conv2d(
+            1, first.out_channels, kernel_size=first.kernel_size,
+            stride=first.stride, padding=first.padding, bias=(first.bias is not None)
+        )
+        model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, 2)
+        return model
+    
+    @staticmethod
+    def _create_convnext_tiny() -> nn.Module:
+        model = convnext_tiny(weights=None)
+        model.features[0][0] = nn.Conv2d(1, 96, kernel_size=4, stride=4, padding=0, bias=True)
+        model.classifier[2] = nn.Linear(model.classifier[2].in_features, 2)
+        return model
+    
+    @staticmethod
+    def _create_vit_b16() -> nn.Module:
+        model = vit_b_16(weights=None)
+        embed_dim = model.conv_proj.out_channels
+        model.conv_proj = nn.Conv2d(1, embed_dim, kernel_size=16, stride=16, bias=True)
+        
+        try:
+            in_features = model.heads.head.in_features
+            model.heads.head = nn.Linear(in_features, 2)
+        except Exception:
+            last = list(model.heads.children())[-1]
+            in_features = last.in_features
+            model.heads = nn.Sequential(nn.Linear(in_features, 2))
+        
+        return model
+    
+    @staticmethod
+    def _create_swin_tiny() -> nn.Module:
+        model = swin_t(weights=None)
+        old = model.features[0][0]
+        model.features[0][0] = nn.Conv2d(
+            1, old.out_channels, kernel_size=old.kernel_size,
+            stride=old.stride, padding=old.padding, bias=(old.bias is not None)
+        )
+        model.head = nn.Linear(model.head.in_features, 2)
+        return model
+
+
+class EnsembleModel(nn.Module):
+    """Ensemble of multiple models"""
+    
+    def __init__(self, models: List[nn.Module]):
+        super().__init__()
+        self.models = nn.ModuleList(models)
+        self.fc = nn.Linear(len(models) * 2, 2)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            probs = []
+            for model in self.models:
+                logits = model(x)
+                probs.append(F.softmax(logits, dim=1))
+        
+        combined = torch.cat(probs, dim=1)
+        return self.fc(combined)
+
+
+# ============================================================================
+# TRAINING
+# ============================================================================
+
+class Trainer:
+    """Model trainer with early stopping and AMP"""
+    
+    def __init__(self, model: nn.Module, device: str = Config.DEVICE):
+        self.model = model.to(device)
+        self.device = device
+        self.criterion = nn.CrossEntropyLoss()
+        self.optimizer = torch.optim.AdamW(
+            model.parameters(), lr=Config.LR, weight_decay=Config.WEIGHT_DECAY
+        )
+        self.scaler = torch.amp.GradScaler('cuda', enabled=(device == "cuda"))
+        self.best_val_acc = 0.0
+        self.patience_counter = 0
+    
+    def train(self, dataloaders: Dict[str, DataLoader], epochs: int = Config.EPOCHS,
+              patience: int = Config.PATIENCE, save_path: Optional[str] = None):
+        """Train model with early stopping"""
+        
+        for epoch in range(1, epochs + 1):
+            # Train
+            train_loss, train_acc, _, _ = self._run_epoch(
+                dataloaders["train"], train=True
+            )
+            
+            # Validate
+            val_loss, val_acc, val_logits, val_targets = self._run_epoch(
+                dataloaders["val"], train=False
+            )
+            
+            print(f"Epoch {epoch:02d} | "
+                  f"Train {train_loss:.4f}/{train_acc:.3f} | "
+                  f"Val {val_loss:.4f}/{val_acc:.3f}")
+            
+            # Early stopping
+            if val_acc > self.best_val_acc:
+                self.best_val_acc = val_acc
+                self.patience_counter = 0
+                if save_path:
+                    torch.save(self.model.state_dict(), save_path)
+                    print(f"  -> saved: {save_path}")
+            else:
+                self.patience_counter += 1
+                if self.patience_counter >= patience:
+                    print("Early stopping.")
+                    break
+        
+        return self.best_val_acc
+    
+    def _run_epoch(self, loader: DataLoader, train: bool = False):
+        """Run one epoch"""
+        self.model.train(train)
+        total, correct, loss_sum = 0, 0, 0.0
+        all_logits, all_targets = [], []
+        
+        pbar = tqdm(loader, leave=False)
+        for x, y in pbar:
+            x = x.to(self.device, non_blocking=True)
+            y = torch.as_tensor(y, device=self.device)
+            
+            if train:
+                self.optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast(device_type='cuda', 
+                                       enabled=(self.device == "cuda")):
+                    logits = self.model(x)
+                    loss = self.criterion(logits, y)
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                with torch.no_grad(), torch.amp.autocast(device_type='cuda',
+                                                         enabled=(self.device == "cuda")):
+                    logits = self.model(x)
+                    loss = self.criterion(logits, y)
+            
+            loss_sum += loss.item() * x.size(0)
+            preds = logits.argmax(1)
+            correct += (preds == y).sum().item()
+            total += x.size(0)
+            all_logits.append(logits.detach().float().cpu())
+            all_targets.append(y.detach().cpu())
+            
+            mode = 'Train' if train else 'Eval'
+            pbar.set_description(
+                f"{mode} loss {loss_sum/max(total,1):.4f} "
+                f"acc {correct/max(total,1):.3f}"
+            )
+        
+        avg_loss = loss_sum / max(total, 1)
+        acc = correct / max(total, 1)
+        return avg_loss, acc, torch.cat(all_logits), torch.cat(all_targets)
+    
+    def evaluate(self, loader: DataLoader) -> Dict:
+        """Evaluate model and return metrics"""
+        self.model.eval()
+        _, acc, logits, targets = self._run_epoch(loader, train=False)
+        
+        probs = F.softmax(logits, dim=1)[:, 1].numpy()
+        preds = (probs >= 0.5).astype(int)
+        tgts = targets.numpy()
+        
+        return {
+            "accuracy": acc,
+            "roc_auc": roc_auc_score(tgts, probs),
+            "predictions": preds,
+            "probabilities": probs,
+            "targets": tgts,
+            "logits": logits
+        }
+
+
+class ThresholdTuner:
+    """Tune classification threshold using validation set"""
+    
+    def __init__(self, model: nn.Module, device: str = Config.DEVICE):
+        self.model = model.to(device).eval()
+        self.device = device
+    
+    @torch.no_grad()
+    def find_optimal_threshold(self, val_loader: DataLoader) -> float:
+        """Find optimal threshold using Youden's J statistic"""
+        # Collect predictions
+        all_probs, all_targets = [], []
+        
+        with torch.amp.autocast(device_type='cuda', 
+                               enabled=(self.device == "cuda")):
+            for x, y in tqdm(val_loader, desc="Tuning threshold"):
+                x = x.to(self.device, non_blocking=True)
+                logits = self.model(x)
+                probs = F.softmax(logits, dim=1)[:, 1]
+                all_probs.append(probs.detach().float().cpu().numpy())
+                all_targets.append(y.numpy())
+        
+        probs = np.concatenate(all_probs)
+        targets = np.concatenate(all_targets)
+        
+        # Find threshold maximizing Youden's J
+        fpr, tpr, thresholds = roc_curve(targets, probs)
+        j_scores = tpr - fpr
+        best_idx = int(np.argmax(j_scores))
+        best_threshold = float(thresholds[best_idx])
+        
+        print(f"Optimal threshold (Youden's J): {best_threshold:.6f}")
+        return best_threshold
+
+
+# ============================================================================
+# EVALUATION AND VISUALIZATION
+# ============================================================================
+
+class Evaluator:
+    """Model evaluation and metrics"""
+    
+    @staticmethod
+    def evaluate_model(model: nn.Module, test_loader: DataLoader,
+                      threshold: float = 0.5,
+                      device: str = Config.DEVICE) -> Dict:
+        """Complete evaluation with all metrics"""
+        model.eval()
+        all_probs, all_targets = [], []
+        
+        with torch.no_grad(), torch.amp.autocast(device_type='cuda',
+                                                 enabled=(device == "cuda")):
+            for x, y in tqdm(test_loader, desc="Evaluating"):
+                x = x.to(device, non_blocking=True)
+                logits = model(x)
+                probs = F.softmax(logits, dim=1)[:, 1]
+                all_probs.append(probs.detach().float().cpu().numpy())
+                all_targets.append(y.numpy())
+        
+        probs = np.concatenate(all_probs)
+        targets = np.concatenate(all_targets)
+        preds = (probs >= threshold).astype(int)
+        
+        # Calculate metrics
+        acc = (preds == targets).mean()
+        roc_auc = roc_auc_score(targets, probs)
+        
+        print(f"\n{'='*60}")
+        print(f"TEST RESULTS (threshold={threshold:.4f})")
+        print(f"{'='*60}")
+        print(f"Accuracy: {acc:.4f}")
+        print(f"ROC-AUC: {roc_auc:.6f}")
+        print(f"\n{classification_report(targets, preds, target_names=['Real(0)', 'AI(1)'])}")
+        print(f"\nConfusion Matrix:")
+        print(confusion_matrix(targets, preds))
+        
+        return {
+            "accuracy": acc,
+            "roc_auc": roc_auc,
+            "predictions": preds,
+            "probabilities": probs,
+            "targets": targets,
+            "threshold": threshold
         }
     
-    def _plot_evaluation(self, targets, probs, preds):
+    @staticmethod
+    def plot_results(results: Dict, title: str = "Model Performance"):
         """Plot ROC curve and confusion matrix"""
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
         
         # ROC Curve
-        fpr, tpr, _ = roc_curve(targets, probs)
+        fpr, tpr, _ = roc_curve(results["targets"], results["probabilities"])
         roc_auc = auc(fpr, tpr)
         
-        ax1.plot(fpr, tpr, lw=2, label=f'AUC = {roc_auc:.4f}')
-        ax1.plot([0, 1], [0, 1], 'k--', lw=1)
-        ax1.set_xlim([0.0, 1.0])
-        ax1.set_ylim([0.0, 1.05])
-        ax1.set_xlabel('False Positive Rate')
-        ax1.set_ylabel('True Positive Rate')
-        ax1.set_title(f'ROC Curve - {self.model_config.model_name}')
-        ax1.legend(loc="lower right")
-        ax1.grid(alpha=0.3)
+        axes[0].plot(fpr, tpr, lw=2, label=f"AUC = {roc_auc:.3f}")
+        axes[0].plot([0, 1], [0, 1], linestyle="--", color="navy")
+        axes[0].set_xlabel("False Positive Rate")
+        axes[0].set_ylabel("True Positive Rate")
+        axes[0].set_title(f"ROC Curve — {title}")
+        axes[0].legend()
+        axes[0].grid(True, linestyle="--", alpha=0.6)
         
         # Confusion Matrix
-        cm = confusion_matrix(targets, preds)
-        sns.heatmap(
-            cm, annot=True, fmt='d', cmap='Blues',
-            xticklabels=['Real', 'AI'],
-            yticklabels=['Real', 'AI'],
-            ax=ax2
-        )
-        ax2.set_ylabel('True Label')
-        ax2.set_xlabel('Predicted Label')
-        ax2.set_title(f'Confusion Matrix (threshold={self.threshold:.3f})')
+        cm = confusion_matrix(results["targets"], results["predictions"])
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=axes[1],
+                   xticklabels=["Real(0)", "AI(1)"],
+                   yticklabels=["Real(0)", "AI(1)"])
+        axes[1].set_xlabel("Predicted")
+        axes[1].set_ylabel("True")
+        axes[1].set_title(f"Confusion Matrix — {title}")
         
         plt.tight_layout()
-        
-        eval_plot = self.models_dir / f"{self.model_config.model_name}_evaluation.png"
-        plt.savefig(eval_plot, dpi=150, bbox_inches='tight')
-        print(f"\n✓ Evaluation plot saved to: {eval_plot}")
         plt.show()
     
-    def predict(
-        self,
-        audio_path: Union[str, Path],
-        return_probs: bool = False
-    ) -> Union[PredictionResult, Dict]:
-        """
-        Predict if audio is AI or Real
+    @staticmethod
+    def compare_models(results_dict: Dict[str, Dict]):
+        """Compare multiple models"""
+        data = []
+        for model_name, results in results_dict.items():
+            # Extract F1 score from predictions
+            from sklearn.metrics import f1_score
+            f1 = f1_score(results["targets"], results["predictions"])
+            data.append({
+                "Model": model_name,
+                "ACC": results["accuracy"],
+                "ROC_AUC": results["roc_auc"],
+                "F1": f1
+            })
         
-        Args:
-            audio_path: Path to audio file
-            return_probs: Return full probability distribution
+        df = pd.DataFrame(data)
+        
+        # Plot comparison
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        
+        # Bar plot
+        df_melt = df.melt(id_vars="Model", value_vars=["ACC", "ROC_AUC", "F1"],
+                         var_name="Metric", value_name="Score")
+        sns.barplot(x="Model", y="Score", hue="Metric", data=df_melt, ax=axes[0])
+        axes[0].set_ylim(0.9, 1.01)
+        axes[0].set_xticklabels(axes[0].get_xticklabels(), rotation=45, ha="right")
+        axes[0].set_title("Model Comparison — Bar Chart")
+        axes[0].legend(loc="lower right")
+        axes[0].grid(axis="y", ls="--", alpha=0.6)
+        
+        # Line plot
+        axes[1].plot(df["Model"], df["ACC"], marker="o", label="Accuracy")
+        axes[1].plot(df["Model"], df["ROC_AUC"], marker="s", label="ROC-AUC")
+        axes[1].plot(df["Model"], df["F1"], marker="^", label="F1-score")
+        axes[1].set_xticklabels(df["Model"], rotation=45, ha="right")
+        axes[1].set_ylim(0.9, 1.01)
+        axes[1].set_ylabel("Score")
+        axes[1].set_title("Model Comparison — Line Chart")
+        axes[1].legend()
+        axes[1].grid(ls="--", alpha=0.6)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return df
+
+
+# ============================================================================
+# PIPELINE ORCHESTRATOR
+# ============================================================================
+
+class AudioProcessingPipeline:
+    """End-to-end audio processing pipeline"""
+    
+    def __init__(self):
+        self.loader = AudioLoader()
+        self.denoiser = AudioDenoiser()
+        self.preprocessor = AudioPreprocessor()
+        self.spec_gen = SpectrogramGenerator()
+    
+    def process_folder(self, src_dir: str, dst_dir: str, 
+                      denoise: bool = True, method: str = "auto"):
+        """Process all audio files in a folder"""
+        os.makedirs(dst_dir, exist_ok=True)
+        files = FileUtils.list_audio_files(src_dir)
+        skipped = 0
+        
+        for fp in tqdm(files, desc=f"Processing {os.path.basename(src_dir)}"):
+            out_name = FileUtils.unique_output_name(fp)
+            out_path = os.path.join(dst_dir, out_name)
+         
+            if os.path.exists(out_path):
+                continue
+      
+            try:
+                # Load
+                wav = self.loader.load(fp)
+               
+                if wav is None:
+                    skipped += 1
+                    continue
+                
+                # Denoise
+                if denoise:
+                    wav = self.denoiser.denoise(wav, method=method)
+                
+                # Save
+                self._save_wav(wav, out_path)
+            except Exception as e:
+                skipped += 1
+        
+        print(f"{src_dir} -> {dst_dir} | total={len(files)} | skipped={skipped}")
+    
+    def create_spectrograms(self, audio_dir: str, output_dir: str):
+        """Create spectrogram images from audio files"""
+        os.makedirs(output_dir, exist_ok=True)
+        files = glob.glob(os.path.join(audio_dir, "*.wav"))
+        skipped = 0
+      
+        for fp in tqdm(files, desc=f"Generating spectrograms"):
+            base_name = os.path.splitext(os.path.basename(fp))[0]
+            out_path = os.path.join(output_dir, f"{base_name}.png")
+           
+            if os.path.exists(out_path):
+                continue
+          
             
-        Returns:
-            PredictionResult object or dict with probabilities
-        """
-        if self.model is None:
-            raise ValueError("Train or load model first")
+            try:
+                wav = self.loader.load(fp)
+                
+                if wav is None:
+                    skipped += 1
+                    continue
+                
+             
+                # Preprocess
+                wav = self.preprocessor.process(wav)
+                if wav is None:
+                    skipped += 1
+                    continue
+                
+                # Generate spectrogram
+                img_array = self.spec_gen.generate(wav)
+            
+                Image.fromarray(img_array).save(out_path, format="PNG")
+            except Exception as e:
+                skipped += 1
+     
+       
+        print(f"{audio_dir} -> {output_dir} | total={len(files)} | skipped={skipped}")
+        exit()
+    
+    @staticmethod
+    def _save_wav(tensor_gpu: torch.Tensor, path: str, sr: int = Config.SR):
+        """Save tensor as WAV file"""
+        y = tensor_gpu.detach().cpu().squeeze(0).numpy()
+        sf.write(path, y, sr, subtype="PCM_16")
+
+
+# ============================================================================
+# INFERENCE
+# ============================================================================
+
+class VoiceDetector:
+    """High-level interface for AI voice detection"""
+    
+    def __init__(self, model_path: str, threshold: float = 0.5,
+                 device: str = Config.DEVICE):
+        self.device = device
+        self.threshold = threshold
+        
+        # Load model
+        if model_path.endswith('.torchscript.pt'):
+            self.model = torch.jit.load(model_path, map_location=device)
+        else:
+            # Load regular PyTorch model (requires model architecture)
+            self.model = torch.load(model_path, map_location=device)
         
         self.model.eval()
         
-        # Process audio
-        wav = self.audio_processor.load_audio(audio_path)
-        wav = self.audio_processor.preprocess(wav)
-        
+        # Initialize components
+        self.loader = AudioLoader(device=device)
+        self.preprocessor = AudioPreprocessor(device=device)
+        self.spec_gen = SpectrogramGenerator(device=device)
+    
+    @torch.no_grad()
+    def predict(self, audio_path: str) -> Dict:
+        """
+        Predict if audio is AI-generated or real
+        Returns: dict with path, probability, label, threshold
+        """
+        # Load and preprocess
+        wav = self.loader.load(audio_path)
         if wav is None:
-            raise ValueError("Audio too short after preprocessing")
+            raise ValueError(f"Could not load audio: {audio_path}")
         
-        x = self.audio_processor.audio_to_model_input(
-            wav, self.model_config.img_size
-        )
+        # Convert to model input
+        x = self.spec_gen.wav_to_tensor(wav)  # (1, 1, 224, 224)
         
         # Predict
-        with torch.no_grad():
-            with torch.amp.autocast(
-                device_type='cuda',
-                enabled=(self.device == "cuda")
-            ):
-                logits = self.model(x)
-                probs = F.softmax(logits, dim=1).squeeze(0)
+        with torch.amp.autocast(device_type='cuda', 
+                               enabled=(self.device == "cuda")):
+            logits = self.model(x)
+            prob_ai = F.softmax(logits, dim=1)[0, 1].item()
         
-        prob_real = probs[0].item()
-        prob_ai = probs[1].item()
+        label = "AI voice" if prob_ai >= self.threshold else "Real voice"
         
-        prediction = "AI" if prob_ai >= self.threshold else "Real"
-        confidence = max(prob_ai, prob_real)
-        
-        result = PredictionResult(
-            file_path=str(audio_path),
-            prediction=prediction,
-            confidence=confidence,
-            prob_ai=prob_ai,
-            prob_real=prob_real,
-            threshold=self.threshold
-        )
-        
-        return result.to_dict() if return_probs else result
-    
-    def predict_batch(
-        self,
-        audio_paths: List[Union[str, Path]],
-        batch_size: int = 32
-    ) -> List[PredictionResult]:
-        """
-        Predict multiple audio files
-        
-        Args:
-            audio_paths: List of audio file paths
-            batch_size: Batch size for processing
-            
-        Returns:
-            List of PredictionResult objects
-        """
-        results = []
-        
-        for audio_path in tqdm(audio_paths, desc="Predicting"):
-            try:
-                result = self.predict(audio_path)
-                results.append(result)
-            except Exception as e:
-                print(f"Error processing {audio_path}: {e}")
-                results.append(None)
-        
-        return results
-    
-    def save(self, path: Union[str, Path]):
-        """
-        Save model and configuration
-        
-        Args:
-            path: Path to save directory
-        """
-        path = Path(path)
-        path.mkdir(parents=True, exist_ok=True)
-        
-        # Save model
-        if self.model is not None:
-            torch.save(
-                self.model.state_dict(),
-                path / "model.pt"
-            )
-        
-        # Save config
-        config = {
-            'model_name': self.model_config.model_name,
-            'threshold': self.threshold,
-            'audio_config': asdict(self.audio_config),
-            'model_config': asdict(self.model_config)
+        result = {
+            "path": audio_path,
+            "prob_ai": prob_ai,
+            "threshold": self.threshold,
+            "label": label
         }
         
-        with open(path / "config.json", 'w') as f:
-            json.dump(config, f, indent=2)
+        print(f"\nFile: {audio_path}")
+        print(f"Prob(AI) = {prob_ai:.6f} | Threshold = {self.threshold:.3f} -> {label}")
         
-        # Export to TorchScript
-        if self.model is not None:
-            example = torch.randn(
-                1, 1, 
-                self.model_config.img_size,
-                self.model_config.img_size,
-                device=self.device
-            )
-            self.model.eval()
-            ts_model = torch.jit.trace(self.model, example)
-            ts_model.save(str(path / "model_torchscript.pt"))
-        
-        print(f"✓ Model saved to: {path}")
+        return result
     
-    @classmethod
-    def load(cls, path: Union[str, Path], device: Optional[str] = None):
-        """
-        Load model and configuration
+    def predict_batch(self, audio_paths: List[str]) -> List[Dict]:
+        """Predict multiple audio files"""
+        results = []
+        for path in tqdm(audio_paths, desc="Predicting"):
+            try:
+                result = self.predict(path)
+                results.append(result)
+            except Exception as e:
+                print(f"Error processing {path}: {e}")
+                results.append({
+                    "path": path,
+                    "error": str(e)
+                })
+        return results
+    
+    def export_torchscript(self, output_path: str):
+        """Export model to TorchScript"""
+        example = torch.randn(1, 1, Config.IMG_SIZE, Config.IMG_SIZE, 
+                             device=self.device)
+        self.model.eval()
+        ts = torch.jit.trace(self.model, example)
+        ts.save(output_path)
+        print(f"TorchScript model saved: {output_path}")
+
+
+# ============================================================================
+# MAIN WORKFLOW
+# ============================================================================
+
+class WorkflowManager:
+    """Manage complete training workflow"""
+    
+    def __init__(self):
+        Config.setup_environment()
+        self.pipeline = AudioProcessingPipeline()
+        self.dataset_builder = DatasetBuilder()
+    
+    def prepare_data(self):
+        """Prepare data: denoise and create spectrograms"""
+        print("\n" + "="*60)
+        print("STEP 1: Audio Denoising")
+        print("="*60)
         
-        Args:
-            path: Path to saved model directory
-            device: Device to load model on
-            
-        Returns:
-            VoiceDetector instance
-        """
-        path = Path(path)
-        
-        # Load config
-        with open(path / "config.json", 'r') as f:
-            config = json.load(f)
-        
-        # Create instance
-        detector = cls(
-            model_name=config['model_name'],
-            device=device,
-            audio_config=AudioConfig(**config['audio_config']),
-            model_config=ModelConfig(**config['model_config'])
+        # Process AI audio
+        self.pipeline.process_folder(
+            Config.AI_DIR,
+            os.path.join(Config.CLEAN_DIR, "ai"),
+            denoise=True, method="auto"
         )
         
-        detector.threshold = config['threshold']
+        # Process Real audio
+        self.pipeline.process_folder(
+            Config.REAL_DIR,
+            os.path.join(Config.CLEAN_DIR, "real"),
+            denoise=True, method="auto"
+        )
+        
+        print("\n" + "="*60)
+        print("STEP 2: Spectrogram Generation")
+        print("="*60)
+        
+        # Create spectrograms for AI
+        self.pipeline.create_spectrograms(
+            os.path.join(Config.CLEAN_DIR, "ai"),
+            os.path.join(Config.IMG_DIR, "ai")
+        )
+        
+        # Create spectrograms for Real
+        self.pipeline.create_spectrograms(
+            os.path.join(Config.CLEAN_DIR, "real"),
+            os.path.join(Config.IMG_DIR, "real")
+        )
+        
+        print("\n" + "="*60)
+        print("STEP 3: Creating Train/Val/Test Splits")
+        print("="*60)
+   
+        self.dataset_builder.create_splits()
+    
+    def train_model(self, model_name: str = "efficientnet_b0") -> str:
+        """Train a single model"""
+        print(f"\n{'='*60}")
+        print(f"Training {model_name.upper()}")
+        print("="*60)
+        
+        # Create model
+        model = ModelFactory.create_model(model_name)
+        
+        # Get dataloaders
+        dataloaders = self.dataset_builder.get_dataloaders()
+        
+        # Train
+        save_path = os.path.join(Config.IMG_DIR, f"best_{model_name}_ai_vs_real.pt")
+        trainer = Trainer(model)
+        trainer.train(dataloaders, save_path=save_path)
+        
+        # Evaluate
+        print(f"\n{'='*60}")
+        print(f"Evaluating {model_name.upper()} on Test Set")
+        print("="*60)
+        
+        model.load_state_dict(torch.load(save_path, map_location=Config.DEVICE))
+        results = Evaluator.evaluate_model(
+            model, dataloaders["test"], threshold=0.5
+        )
+        Evaluator.plot_results(results, title=model_name.upper())
+        
+        return save_path
+    
+    def tune_and_evaluate(self, model_path: str, model_name: str):
+        """Tune threshold and evaluate with optimal threshold"""
+        print(f"\n{'='*60}")
+        print(f"Threshold Tuning for {model_name.upper()}")
+        print("="*60)
         
         # Load model
-        model_path = path / "model.pt"
-        if model_path.exists():
-            detector.model = ModelFactory.create(config['model_name'])
-            detector.model.load_state_dict(
-                torch.load(model_path, map_location=detector.device)
-            )
-            detector.model.to(detector.device)
-            detector.model.eval()
-            print(f"✓ Model loaded from: {path}")
+        model = ModelFactory.create_model(model_name)
+        model.load_state_dict(torch.load(model_path, map_location=Config.DEVICE))
         
-        return detector
-
-
-# ============================================================================
-# CLI Interface (Optional)
-# ============================================================================
-
-def main():
-    """Command-line interface"""
-    import argparse
-    
-    parser = argparse.ArgumentParser(
-        description="AI Voice Detector - Train and predict"
-    )
-    
-    subparsers = parser.add_subparsers(dest='command', help='Commands')
-    
-    # Train command
-    train_parser = subparsers.add_parser('train', help='Train model')
-    train_parser.add_argument('--ai-folder', required=True, help='AI audio folder')
-    train_parser.add_argument('--real-folder', required=True, help='Real audio folder')
-    train_parser.add_argument('--output-dir', required=True, help='Output directory')
-    train_parser.add_argument('--model', default='efficientnet_b0', help='Model name')
-    train_parser.add_argument('--epochs', type=int, default=12, help='Number of epochs')
-    train_parser.add_argument('--no-denoise', action='store_true', help='Skip denoising')
-    
-    # Predict command
-    pred_parser = subparsers.add_parser('predict', help='Predict audio file')
-    pred_parser.add_argument('--model-path', required=True, help='Path to saved model')
-    pred_parser.add_argument('--audio', required=True, help='Audio file path')
-    
-    args = parser.parse_args()
-    
-    if args.command == 'train':
-        detector = VoiceDetector(model_name=args.model)
-        detector.prepare_dataset(
-            args.ai_folder,
-            args.real_folder,
-            args.output_dir,
-            denoise=not args.no_denoise
+        # Get dataloaders
+        dataloaders = self.dataset_builder.get_dataloaders()
+        
+        # Tune threshold
+        tuner = ThresholdTuner(model)
+        best_threshold = tuner.find_optimal_threshold(dataloaders["val"])
+        
+        # Evaluate with tuned threshold
+        results = Evaluator.evaluate_model(
+            model, dataloaders["test"], threshold=best_threshold
         )
-        detector.train()
-        detector.tune_threshold()
-        detector.evaluate()
+        Evaluator.plot_results(results, 
+                              title=f"{model_name.upper()} (Tuned)")
         
-        # Save model
-        save_path = Path(args.output_dir) / "final_model"
-        detector.save(save_path)
+        return results, best_threshold
+
+
+# ============================================================================
+# EXAMPLE USAGE
+# ============================================================================
+
+def main_training_workflow():
+    """Complete training workflow example"""
+    # Initialize
+    workflow = WorkflowManager()
     
-    elif args.command == 'predict':
-        detector = VoiceDetector.load(args.model_path)
-        result = detector.predict(args.audio)
-        print("\n" + "="*60)
-        print(result)
-        print("="*60)
+    # Step 1: Prepare data (uncomment if needed)
+    workflow.prepare_data()
+    
+    # Step 2: Train model
+    model_path = workflow.train_model("efficientnet_b0")
+    
+    # Step 3: Tune threshold and evaluate
+    results, threshold = workflow.tune_and_evaluate(model_path, "efficientnet_b0")
+    
+    # Step 4: Export for inference
+    detector = VoiceDetector(model_path, threshold=threshold)
+    export_path = os.path.join(Config.IMG_DIR, "efficientnet_b0_ai_vs_real.torchscript.pt")
+    detector.export_torchscript(export_path)
+    
+    print(f"\n{'='*60}")
+    print("Training Complete!")
+    print(f"Model: {model_path}")
+    print(f"TorchScript: {export_path}")
+    print(f"Optimal Threshold: {threshold:.6f}")
+    print(f"Test Accuracy: {results['accuracy']:.4f}")
+    print(f"Test ROC-AUC: {results['roc_auc']:.6f}")
+    print("="*60)
+
+
+def main_inference_example():
+    """Inference example"""
+    # Initialize detector
+    model_path = os.path.join(
+        Config.IMG_DIR, 
+        "efficientnet_b0_ai_vs_real.torchscript.pt"
+    )
+    detector = VoiceDetector(model_path, threshold=0.9167826771736145)
+    
+    # Predict single file
+    audio_path = r"C:\path\to\your\audio.wav"
+    result = detector.predict(audio_path)
+    
+    # Predict multiple files
+    audio_files = [
+        r"C:\path\to\audio1.wav",
+        r"C:\path\to\audio2.wav",
+    ]
+    results = detector.predict_batch(audio_files)
+    
+    # Print summary
+    for r in results:
+        if "error" not in r:
+            print(f"{r['label']}: {r['prob_ai']:.4f} - {r['path']}")
 
 
 if __name__ == "__main__":
-    main()
-
-
-# ============================================================================
-# Example Usage
-# ============================================================================
-
-"""
-# Example 1: Quick Training
-detector = VoiceDetector(model_name='efficientnet_b0')
-detector.prepare_dataset(
-    ai_folder='data/ai_voices',
-    real_folder='data/real_voices',
-    output_dir='output'
-)
-detector.train()
-detector.tune_threshold()
-detector.evaluate()
-detector.save('models/voice_detector')
-
-# Example 2: Load and Predict
-detector = VoiceDetector.load('models/voice_detector')
-result = detector.predict('test_audio.wav')
-print(result)
-
-# Example 3: Batch Prediction
-audio_files = ['audio1.wav', 'audio2.wav', 'audio3.wav']
-results = detector.predict_batch(audio_files)
-for result in results:
-    if result:
-        print(f"{result.file_path}: {result.prediction} ({result.confidence:.2%})")
-
-# Example 4: Custom Configuration
-from pathlib import Path
-
-audio_cfg = AudioConfig(
-    sample_rate=16000,
-    n_mels=128,
-    denoise_method='auto'
-)
-
-model_cfg = ModelConfig(
-    model_name='resnet18',
-    batch_size=32,
-    epochs=20,
-    learning_rate=1e-4
-)
-
-detector = VoiceDetector(
-    model_name='resnet18',
-    audio_config=audio_cfg,
-    model_config=model_cfg
-)
-
-# Example 5: CLI Usage
-# python script.py train --ai-folder data/ai --real-folder data/real --output-dir output --model efficientnet_b0
-# python script.py predict --model-path models/voice_detector --audio test.wav
-"""
+    # Run training workflow
+    main_training_workflow()
+    
+    # Or run inference
+    # main_inference_example()
