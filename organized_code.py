@@ -13,7 +13,11 @@ Usage:
     result = detector.predict('path/to/audio.wav')
     print(f"Prediction: {result['label']} (confidence: {result['confidence']:.2%})")
 """
-
+import soundfile as sf
+from pathlib import Path
+from typing import Union
+from tqdm import tqdm
+import traceback
 import os
 import sys
 import json
@@ -306,65 +310,92 @@ class AudioProcessor:
             return wav
         
         return self._normalize(vocals)
-    
+    @torch.no_grad()
+    def _normalize(self, wav: torch.Tensor) -> torch.Tensor:
+        """Normalize waveform amplitude safely"""
+        if wav is None or wav.numel() == 0:
+            print("[WARN] _normalize(): empty or None waveform, skipping normalization.")
+            return wav
+
+        abs_wav = torch.abs(wav)
+        if torch.all(abs_wav == 0):
+            print("[WARN] _normalize(): silent waveform, skipping normalization.")
+            return wav
+
+        mx = torch.amax(abs_wav)
+        return wav / (mx + 1e-9)
+
     @torch.no_grad()
     def vad_trim(self, wav: torch.Tensor) -> torch.Tensor:
         """Voice Activity Detection trimming"""
         T = wav.shape[-1]
         hop = int(self.config.sample_rate * self.config.vad_frame_ms / 1000.0)
         win = hop
-        
+
         if T < win:
             return wav
-        
+
         frames = wav.unfold(dimension=-1, size=win, step=hop)
         energy = (frames ** 2).mean(dim=-1).squeeze(0)
-        
+
         thr = torch.median(energy) * self.config.vad_threshold
         mask = energy > thr
-        
+
         if not mask.any():
+            print("[WARN] vad_trim(): no active frames detected, skipping trim.")
             return wav
-        
-        idx = torch.nonzero(mask, as_tuple=False).squeeze(1)
-        start_f, end_f = idx[0].item(), idx[-1].item()
-        
+
+        idx = torch.nonzero(mask, as_tuple=False).squeeze()
+        if idx.ndim > 1:
+            idx = idx[:, -1]
+
+        start_f = idx[0].item()
+        end_f = idx[-1].item()
+
         pad = int(self.config.sample_rate * self.config.vad_pad_ms / 1000.0)
         start = max(0, start_f * hop - pad)
         end = min(T, (end_f + 1) * hop + pad)
-        
-        return wav[:, start:end] if end > start else wav
-    
+
+        trimmed = wav[:, start:end] if end > start else wav
+
+        if trimmed.numel() == 0:
+            print("[WARN] vad_trim(): produced empty waveform, returning original.")
+            return wav
+
+        return trimmed
+
     @torch.no_grad()
     def preprocess(self, wav: torch.Tensor) -> Optional[torch.Tensor]:
         """
         Full preprocessing pipeline
         Returns None if audio too short after processing
         """
-        # VAD trimming
-        wav = self.vad_trim(wav)
-        
-        # High-pass filter
-        if self.config.hpf_cutoff > 0:
-            wav = torchaudio.functional.highpass_biquad(
-                wav, self.config.sample_rate, self.config.hpf_cutoff
-            )
-        
-        # Pre-emphasis
-        if self.config.pre_emphasis > 0:
-            x_shift = torch.zeros_like(wav)
-            x_shift[..., 1:] = wav[..., :-1]
-            wav = wav - self.config.pre_emphasis * x_shift
-        
-        wav = self._normalize(wav)
-        
-        # Check minimum length
-        min_samples = self.config.hop_length * 6
-        if wav.shape[-1] < min_samples:
-            return None
-        
-        return wav
-    
+        try:
+            # VAD trimming
+            wav = self.vad_trim(wav)
+            
+            # High-pass filter
+            if self.config.hpf_cutoff > 0:
+                wav = torchaudio.functional.highpass_biquad(
+                    wav, self.config.sample_rate, self.config.hpf_cutoff
+                )
+            
+            # Pre-emphasis
+            if self.config.pre_emphasis > 0:
+                x_shift = torch.zeros_like(wav)
+                x_shift[..., 1:] = wav[..., :-1]
+                wav = wav - self.config.pre_emphasis * x_shift
+            
+            wav = self._normalize(wav)
+            
+            # Check minimum length
+            min_samples = self.config.hop_length * 6
+            if wav.shape[-1] < min_samples:
+                return None
+            
+            return wav
+        except Exception:
+            pass
     @torch.no_grad()
     def wav_to_mel_spectrogram(self, wav: torch.Tensor) -> torch.Tensor:
         """
@@ -854,6 +885,7 @@ class VoiceDetector:
         print(f"  Output directory: {self.output_dir}")
         print(f"  Splits saved to: {self.splits_dir}")
     
+
     def _process_audio_folder(
         self,
         input_dir: Union[str, Path],
@@ -861,31 +893,43 @@ class VoiceDetector:
         denoise: bool,
         label: str
     ):
-        """Process all audio files in a folder"""
+        """Process all audio files in a folder (verbose mode with detailed error logs)"""
         audio_files = self._list_audio_files(input_dir)
-        print(f"  Processing {len(audio_files)} {label} files...")
-        
+        print(f"\n[INFO] Found {len(audio_files)} {label} files in '{input_dir}'")
+
         skipped = 0
-        for audio_path in tqdm(audio_files, desc=f"  {label}"):
+        processed = 0
+
+        for audio_path in tqdm(audio_files, desc=f"Processing {label}"):
             output_path = output_dir / f"{Path(audio_path).stem}.wav"
-            
-            if output_path.exists():
-                continue
-            
+
             try:
-                # Load and process
+                print(f"\n--- Processing file: {audio_path}")
+                if output_path.exists():
+                    print(f"[SKIP] Output already exists → {output_path}")
+                    continue
+
+                # Load audio
+                print("[STEP] Loading audio...")
                 wav = self.audio_processor.load_audio(audio_path)
-                
+                print(f"[OK] Loaded waveform shape: {getattr(wav, 'shape', 'unknown')}")
+
+                # Optional denoising
                 if denoise:
+                    print("[STEP] Applying denoising...")
                     wav = self.audio_processor.denoise(wav)
-                
+                    print("[OK] Denoising completed.")
+
+                # Preprocessing
+                print("[STEP] Preprocessing audio...")
                 wav = self.audio_processor.preprocess(wav)
-                
+
                 if wav is None:
                     skipped += 1
+                    print("[WARN] Skipped: preprocessing returned None.")
                     continue
-                
-                # Save
+
+                # Convert to numpy and save
                 wav_np = wav.squeeze(0).cpu().numpy()
                 sf.write(
                     str(output_path),
@@ -893,11 +937,22 @@ class VoiceDetector:
                     self.audio_config.sample_rate,
                     subtype='PCM_16'
                 )
+                processed += 1
+                print(f"[OK] Saved processed file → {output_path}")
+
             except Exception as e:
                 skipped += 1
-        
-        print(f"    Processed: {len(audio_files) - skipped}, Skipped: {skipped}")
-    
+                print(f"\n[ERROR] Exception while processing {audio_path}")
+                print(f"  → {type(e).__name__}: {e}")
+                print("  --- Full Traceback ---")
+                traceback.print_exc()  # shows the complete traceback in the console
+                print("  ----------------------")
+
+        print(f"\n[SUMMARY] {label} folder:")
+        print(f"  Total files: {len(audio_files)}")
+        print(f"  Successfully processed: {processed}")
+        print(f"  Skipped: {skipped}")
+        print(f"  Output directory: {output_dir}\n")
     def _create_spectrograms(
         self,
         input_dir: Path,
