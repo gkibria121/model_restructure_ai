@@ -3,4 +3,5 @@ venv
 output/
 dataset
 models
-log.txt
+*log.txt
+output.zip
